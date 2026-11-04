@@ -5,6 +5,7 @@ AGY Statusline - Real-time HUD Status Line for Google Antigravity CLI (agy)
 import sys
 import json
 import os
+import sqlite3
 
 # Ensure UTF-8 output across Windows, macOS, and Linux
 if hasattr(sys.stdout, "reconfigure"):
@@ -116,12 +117,159 @@ def get_git_branch(start_path):
     return ""
 
 
+def _parse_chat_model_metadata(buf):
+    """
+    Extract (response_model, model_display_name) from a serialized
+    CortexStepGeneratorMetadata protobuf blob without external dependencies.
+    Field 1 is chat_model (ChatModelMetadata); inside it:
+      - Field 19 is response_model (e.g. 'gemini-4-argon-trial', 'gemini-3.8-flash-n')
+      - Field 21 is model_display_name (e.g. 'Gemini 4 Argon (High)')
+    """
+    mv = memoryview(buf)
+    n = len(mv)
+    i = 0
+    while i < n:
+        tag = 0
+        shift = 0
+        while i < n:
+            b = mv[i]
+            i += 1
+            tag |= (b & 0x7F) << shift
+            if not (b & 0x80):
+                break
+            shift += 7
+        fnum = tag >> 3
+        wtype = tag & 7
+        if wtype == 0:
+            while i < n and (mv[i] & 0x80):
+                i += 1
+            i += 1
+        elif wtype == 2:
+            ln = 0
+            shift = 0
+            while i < n:
+                b = mv[i]
+                i += 1
+                ln |= (b & 0x7F) << shift
+                if not (b & 0x80):
+                    break
+                shift += 7
+            if fnum == 1:
+                sub = mv[i : i + ln]
+                m = len(sub)
+                j = 0
+                resp_model = ""
+                disp_name = ""
+                while j < m:
+                    ctag = 0
+                    cshift = 0
+                    while j < m:
+                        cb = sub[j]
+                        j += 1
+                        ctag |= (cb & 0x7F) << cshift
+                        if not (cb & 0x80):
+                            break
+                        cshift += 7
+                    cfnum = ctag >> 3
+                    cwtype = ctag & 7
+                    if cwtype == 0:
+                        while j < m and (sub[j] & 0x80):
+                            j += 1
+                        j += 1
+                    elif cwtype == 2:
+                        cln = 0
+                        cshift = 0
+                        while j < m:
+                            cb = sub[j]
+                            j += 1
+                            cln |= (cb & 0x7F) << cshift
+                            if not (cb & 0x80):
+                                break
+                            cshift += 7
+                        if cfnum == 19:
+                            resp_model = bytes(sub[j : j + cln]).decode("utf-8", errors="ignore").strip()
+                        elif cfnum == 21:
+                            disp_name = bytes(sub[j : j + cln]).decode("utf-8", errors="ignore").strip()
+                        j += cln
+                    elif cwtype == 5:
+                        j += 4
+                    elif cwtype == 1:
+                        j += 8
+                    else:
+                        break
+                if resp_model or disp_name:
+                    return resp_model, disp_name
+            i += ln
+        elif wtype == 5:
+            i += 4
+        elif wtype == 1:
+            i += 8
+        else:
+            break
+    return "", ""
+
+
+def get_upstream_response_model(data, expected_display_name=""):
+    """
+    Query the current conversation SQLite database for the latest upstream
+    response_model recorded in gen_metadata.
+    """
+    if isinstance(data.get("model"), dict) and data["model"].get("response_model"):
+        return str(data["model"]["response_model"]).strip()
+
+    conv_id = data.get("conversation_id") or data.get("session_id")
+    if not conv_id or not isinstance(conv_id, str):
+        return ""
+
+    db_path = os.path.join(
+        os.path.expanduser("~/.gemini/antigravity-cli/conversations"),
+        f"{conv_id}.db",
+    )
+    if not os.path.isfile(db_path):
+        transcript_path = data.get("transcript_path") or ""
+        if transcript_path:
+            # Walk up from <config_dir>/brain/<conv_id>/... to <config_dir>
+            cur = os.path.abspath(transcript_path)
+            for _ in range(6):
+                parent = os.path.dirname(cur)
+                if os.path.basename(cur) == "brain" and parent:
+                    candidate = os.path.join(parent, "conversations", f"{conv_id}.db")
+                    if os.path.isfile(candidate):
+                        db_path = candidate
+                    break
+                if parent == cur:
+                    break
+                cur = parent
+
+    if not os.path.isfile(db_path):
+        return ""
+
+    try:
+        with sqlite3.connect(db_path, timeout=0.05) as con:
+            rows = con.execute(
+                "SELECT data FROM gen_metadata ORDER BY idx DESC LIMIT 5"
+            ).fetchall()
+        for (blob,) in rows:
+            if not blob:
+                continue
+            resp_model, disp_name = _parse_chat_model_metadata(blob)
+            # If the user just switched models in the UI and hasn't sent a turn
+            # with the new model yet, avoid displaying the previous model's ID.
+            if disp_name and expected_display_name and disp_name != expected_display_name:
+                return ""
+            if resp_model:
+                return resp_model
+    except Exception:
+        pass
+    return ""
+
+
 def render_statusline(data):
     """Render the 2-line HUD status string from Antigravity state data."""
     # === 1. Line 1: Model, Directory, Git Branch, Agent State ===
     line1_items = []
 
-    # (1) Model Name
+    # (1) Model Name & Upstream Response Model
     model_info = data.get("model")
     model_name = "Gemini"
     if isinstance(model_info, dict):
@@ -133,7 +281,12 @@ def render_statusline(data):
     clean_model = model_name.replace("Gemini", "").replace("Google", "").strip()
     if not clean_model:
         clean_model = model_name
-    line1_items.append(f"🤖 {CYAN}{BOLD}{clean_model}{RESET}")
+
+    response_model = get_upstream_response_model(data, expected_display_name=model_name)
+    model_item = f"🤖 {CYAN}{BOLD}{clean_model}{RESET}"
+    if response_model:
+        model_item += f" {GRAY}[{response_model}]{RESET}"
+    line1_items.append(model_item)
 
     # (2) Working Directory
     cwd = data.get("cwd") or (data.get("workspace", {}) or {}).get("current_dir") or ""
@@ -243,7 +396,10 @@ def main():
     # Preview / test mode
     if len(sys.argv) > 1 and sys.argv[1] in ("--test", "-t", "--preview"):
         preview_data = {
-            "model": {"display_name": "Gemini 3.8 Flash (High)"},
+            "model": {
+                "display_name": "Gemini 4 Argon (High)",
+                "response_model": "gemini-4-argon-trial"
+            },
             "cwd": os.getcwd(),
             "vcs": {"branch": get_git_branch(os.getcwd()) or "main"},
             "agent_state": "reviewing",

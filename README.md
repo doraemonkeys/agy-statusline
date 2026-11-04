@@ -5,7 +5,7 @@ A sleek, real-time two-line HUD statusline for **Google Antigravity CLI (`agy`)*
 [English](README.md) | [中文说明](README_zh.md)
 
 ```text
-🤖 3.8 Flash (High) │ 📁 my-project │ 🌿 main │ ⚡ reviewing
+🤖 4 Argon (High) [gemini-4-argon-trial] │ 📁 my-project │ 🌿 main │ ⚡ reviewing
 🧠 Context ██░░░░░░░░ 244.6k/1.0M (24.5%) │ ⏳ 5h: 95% (4h 56m) │ 📅 Wk: 99% (167h 56m)
 ```
 
@@ -13,7 +13,7 @@ A sleek, real-time two-line HUD statusline for **Google Antigravity CLI (`agy`)*
 
 ## ✨ Features
 
-- 🤖 **Clean Model Indicator** — Intelligently shortens model identifiers (e.g. `Gemini 3.8 Flash High` → `3.8 Flash (High)`), keeping the line concise without sacrificing edition details.
+- 🤖 **Clean Model Indicator & Upstream Variant Inspection** — Intelligently shortens frontend model identifiers (e.g. `Gemini 4 Argon (High)` → `4 Argon (High)`) and extracts the exact upstream `response_model` (e.g. `[gemini-4-argon-trial]`, `[gemini-3.8-flash-n]`) directly from conversation `gen_metadata`.
 - 📁 **Workspace Awareness** — Displays the current working directory.
 - 🌿 **Ultra-fast Git Detection** — Reads `.git/HEAD` directly by walking parent directories (supports standard repos, worktrees, and submodules). **Zero subprocess spawning**, eliminating lag.
 - ⚡ **Agent State Display** — Live agent lifecycle state (`idle`, `ready`, `reviewing`, etc.) with dynamic color coding.

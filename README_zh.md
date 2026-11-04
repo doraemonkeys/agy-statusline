@@ -5,7 +5,7 @@
 [English](README.md) | [中文说明](README_zh.md)
 
 ```text
-🤖 3.8 Flash (High) │ 📁 my-project │ 🌿 main │ ⚡ reviewing
+🤖 4 Argon (High) [gemini-4-argon-trial] │ 📁 my-project │ 🌿 main │ ⚡ reviewing
 🧠 Context ██░░░░░░░░ 244.6k/1.0M (24.5%) │ ⏳ 5h: 95% (4h 56m) │ 📅 Wk: 99% (167h 56m)
 ```
 
@@ -13,7 +13,7 @@
 
 ## ✨ 特性
 
-- 🤖 **精简模型显示** — 智能提取并简化模型名称（如 `Gemini 3.8 Flash High` → `3.8 Flash (High)`），节约终端行空间，保留版本核心信息。
+- 🤖 **精简模型显示 + 上游真实型号透视** — 智能简化前端模型名称（如 `Gemini 4 Argon (High)` → `4 Argon (High)`），并直接从会话库 `gen_metadata` 实时解析上游返回的真实 `response_model`（如 `[gemini-4-argon-trial]`、`[gemini-3.8-flash-n]`）。
 - 📁 **工作目录展示** — 实时展示当前项目目录。
 - 🌿 **极速 Git 分支检测** — 通过向上遍历目录直接解析 `.git/HEAD` 文件（原生兼容主分支、Git Worktree 与 Submodule），**不启动任何 Git 子进程**，零性能损耗、毫秒级响应。
 - ⚡ **Agent 运行状态** — 实时反映 Agent 当前生命周期（`idle`、`ready`、`reviewing` 等），带自适应颜色高亮。
