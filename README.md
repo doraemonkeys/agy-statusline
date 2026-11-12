@@ -44,8 +44,12 @@ A sleek, real-time two-line HUD statusline for **Google Antigravity CLI (`agy`)*
 
 The script will automatically:
 - Copy `statusline.py` into `~/.gemini/antigravity-cli/statusline.py`
-- Backup your existing `settings.json`
-- Configure the `"statusLine"` command hook
+- Pin the installing Python interpreter's absolute path and use `-S` to skip site initialization
+- On Windows, create `statusline.cmd` to handle the CLI's command quoting correctly
+- Validate the installed command before saving settings, and back up the existing configuration
+- Configure the `"statusLine"` command hook while preserving other settings
+
+Requires Python 3.8 or newer. Rerun the installer after moving or removing the pinned Python installation (for example, when removing an old mise Python version).
 
 ### Method 2: Manual Setup
 
@@ -53,19 +57,19 @@ The script will automatically:
    - **Windows**: `C:\Users\<YourUser>\.gemini\antigravity-cli\statusline.py`
    - **macOS / Linux**: `~/.gemini/antigravity-cli/statusline.py`
 
-2. Open `~/.gemini/antigravity-cli/settings.json` and add or update the `"statusLine"` section:
+2. On macOS/Linux, open `~/.gemini/antigravity-cli/settings.json` and configure absolute paths to your interpreter and the copied script:
 
    ```json
    {
      "statusLine": {
        "type": "command",
-       "command": "python ~/.gemini/antigravity-cli/statusline.py",
+       "command": "/absolute/path/to/python3 -S /absolute/path/to/statusline.py",
        "enabled": true
      }
    }
    ```
 
-   *(On Windows, use forward slashes or escaped backslashes, e.g., `"python C:/Users/<YourUser>/.gemini/antigravity-cli/statusline.py"`)*.
+   Replace the example paths, and shell-quote each path if it contains spaces or special characters. On Windows, use the automatic installer: it generates a batch launcher and the necessary command escaping instead of embedding quoted Python arguments in the CLI configuration.
 
 ---
 
@@ -74,13 +78,19 @@ The script will automatically:
 You can test and preview the statusline rendering without opening Antigravity:
 
 ```bash
-python statusline.py --preview
+python -S statusline.py --preview
 ```
 
 Output:
 ```text
 🤖 3.8 Flash (High) │ 📁 agy-statusline │ 🌿 main │ ⚡ reviewing
 🧠 Context ██░░░░░░░░ 244.6k/1.0M (24.5%) │ ⏳ 5h: 95% (4h 56m) │ 📅 Wk: 99% (167h 56m)
+```
+
+Run the regression checks for WAL reads, connection cleanup, and installed command execution:
+
+```bash
+python -S -m unittest -v
 ```
 
 ---

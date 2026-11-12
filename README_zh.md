@@ -44,8 +44,12 @@
 
 安装脚本将自动执行：
 - 将 `statusline.py` 复制到 `~/.gemini/antigravity-cli/statusline.py`
-- 自动备份你现有的 `settings.json`（带有时间戳）
-- 自动向 `settings.json` 写入 `"statusLine"` 命令钩子配置
+- 固定安装时使用的 Python 解释器绝对路径，并加上 `-S` 跳过 site 初始化
+- 在 Windows 上创建 `statusline.cmd`，正确处理 CLI 的命令转义
+- 验证实际安装的启动命令后，再备份并保存配置
+- 更新 `"statusLine"` 命令钩子，保留其他设置
+
+需要 Python 3.8 或更新版本。移动或删除已固定的 Python 安装后（例如删除 mise 中的旧版本），请重新运行安装脚本。
 
 ### 方式 2：手动配置
 
@@ -53,19 +57,19 @@
    - **Windows**：`C:\Users\<你的用户名>\.gemini\antigravity-cli\statusline.py`
    - **macOS / Linux**：`~/.gemini/antigravity-cli/statusline.py`
 
-2. 打开 `~/.gemini/antigravity-cli/settings.json`，在最外层加入或更新 `"statusLine"` 节点：
+2. 在 macOS/Linux 上，打开 `~/.gemini/antigravity-cli/settings.json`，使用解释器和已复制脚本的绝对路径配置 `"statusLine"`：
 
    ```json
    {
      "statusLine": {
        "type": "command",
-       "command": "python ~/.gemini/antigravity-cli/statusline.py",
+       "command": "/absolute/path/to/python3 -S /absolute/path/to/statusline.py",
        "enabled": true
      }
    }
    ```
 
-   *(Windows 环境建议使用正斜杠路径，例如 `"python C:/Users/<你的用户名>/.gemini/antigravity-cli/statusline.py"`)*。
+   请替换示例中的绝对路径；路径包含空格或特殊字符时，需要分别进行 shell 转义。Windows 请使用自动安装脚本：安装器会生成批处理启动脚本和正确转义的命令，避免在 CLI 配置中直接嵌入带引号的 Python 参数。
 
 ---
 
@@ -74,13 +78,19 @@
 无需启动 Antigravity，即可在终端直接预览状态栏的渲染效果：
 
 ```bash
-python statusline.py --preview
+python -S statusline.py --preview
 ```
 
 效果输出：
 ```text
 🤖 3.8 Flash (High) │ 📁 agy-statusline │ 🌿 main │ ⚡ reviewing
 🧠 Context ██░░░░░░░░ 244.6k/1.0M (24.5%) │ ⏳ 5h: 95% (4h 56m) │ 📅 Wk: 99% (167h 56m)
+```
+
+运行 WAL 读取、连接释放和安装命令执行的回归检查：
+
+```bash
+python -S -m unittest -v
 ```
 
 ---

@@ -6,6 +6,8 @@ import sys
 import json
 import os
 import sqlite3
+from contextlib import closing
+from pathlib import Path
 
 # Ensure UTF-8 output across Windows, macOS, and Linux
 if hasattr(sys.stdout, "reconfigure"):
@@ -245,7 +247,9 @@ def get_upstream_response_model(data, expected_display_name=""):
         return ""
 
     try:
-        with sqlite3.connect(db_path, timeout=0.05) as con:
+        # Preserve WAL visibility while preventing writes or accidental creation.
+        db_uri = Path(db_path).resolve().as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(db_uri, uri=True, timeout=0.05)) as con:
             rows = con.execute(
                 "SELECT data FROM gen_metadata ORDER BY idx DESC LIMIT 5"
             ).fetchall()
