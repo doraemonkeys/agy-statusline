@@ -15,6 +15,43 @@ import install as installer
 import statusline
 
 
+def encode_varint(value):
+    out = bytearray()
+    while value >= 0x80:
+        out.append((value & 0x7F) | 0x80)
+        value >>= 7
+    out.append(value)
+    return bytes(out)
+
+
+def proto_bytes(field_number, payload):
+    return encode_varint((field_number << 3) | 2) + encode_varint(len(payload)) + payload
+
+
+def proto_varint(field_number, value):
+    return encode_varint((field_number << 3) | 0) + encode_varint(value)
+
+
+def timestamp_blob(seconds, nanos=0):
+    payload = proto_varint(1, int(seconds))
+    if nanos:
+        payload += proto_varint(2, int(nanos))
+    return payload
+
+
+def trajectory_blob(created_sec, nanos=0):
+    return proto_bytes(2, timestamp_blob(created_sec, nanos))
+
+
+def step_metadata_blob(created_sec, updated_sec=None, completed_sec=None):
+    blob = proto_bytes(1, timestamp_blob(created_sec))
+    if updated_sec is not None:
+        blob += proto_bytes(6, timestamp_blob(updated_sec))
+    if completed_sec is not None:
+        blob += proto_bytes(32, timestamp_blob(completed_sec))
+    return blob
+
+
 def metadata(model):
     encoded = model.encode("utf-8")
     chat_model = b"\x9a\x01" + bytes([len(encoded)]) + encoded
@@ -95,6 +132,147 @@ class DatabaseTests(unittest.TestCase):
                 statusline.get_upstream_response_model({"session_id": "session"}), ""
             )
         self.assertFalse(self.database.exists())
+
+    def test_single_connection_reads_model_and_multi_turn_durations(self):
+        with contextlib.closing(self.real_connect(self.database)) as writer:
+            writer.execute("PRAGMA journal_mode=WAL")
+            writer.execute("CREATE TABLE gen_metadata (idx INTEGER, data BLOB)")
+            writer.execute("CREATE TABLE trajectory_metadata_blob (id TEXT, data BLOB)")
+            writer.execute(
+                "CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, metadata BLOB)"
+            )
+            writer.execute("INSERT INTO gen_metadata VALUES (1, ?)", (metadata("gemini-4-carbon-high"),))
+            writer.execute(
+                "INSERT INTO trajectory_metadata_blob VALUES ('main', ?)",
+                (trajectory_blob(1000),),
+            )
+            # Turn 1: t=1000..1120 (2m 00s)
+            writer.execute(
+                "INSERT INTO steps VALUES (0, 14, 3, ?)",
+                (step_metadata_blob(1000),),
+            )
+            writer.execute(
+                "INSERT INTO steps VALUES (1, 15, 3, ?)",
+                (step_metadata_blob(1001, updated_sec=1118, completed_sec=1120),),
+            )
+            writer.commit()
+
+            # Idle at t=1500: Turn 1 duration freezes at 2m 00s; session elapsed is 8m 20s.
+            self.connections.clear()
+            with patch.object(statusline.sqlite3, "connect", self.capture_connection):
+                rendered_idle = statusline.render_statusline(
+                    {"session_id": "session", "agent_state": "idle"},
+                    _now=1500,
+                )
+            self.assertEqual(len(self.connections), 1)
+            self.assert_connections_closed()
+            self.assertIn("[gemini-4-carbon-high]", rendered_idle)
+            self.assertIn(f"⏱️ {statusline.CYAN}2m 00s{statusline.RESET}", rendered_idle)
+            self.assertIn("/ 8m 20s", rendered_idle)
+
+            # Turn 2 starts at t=1500; agent actively working at t=1542 -> 42s / 9m 02s.
+            writer.execute(
+                "INSERT INTO steps VALUES (2, 14, 3, ?)",
+                (step_metadata_blob(1500),),
+            )
+            writer.commit()
+
+            self.connections.clear()
+            with patch.object(statusline.sqlite3, "connect", self.capture_connection):
+                rendered_active = statusline.render_statusline(
+                    {"session_id": "session", "agent_state": "working"},
+                    _now=1542,
+                )
+            self.assertEqual(len(self.connections), 1)
+            self.assert_connections_closed()
+            self.assertIn(f"⏱️ {statusline.YELLOW}42s{statusline.RESET}", rendered_active)
+            self.assertIn("/ 9m 02s", rendered_active)
+
+            # Running step (status=2) keeps turn live even if agent_state is omitted.
+            writer.execute(
+                "INSERT INTO steps VALUES (3, 132, 2, ?)",
+                (step_metadata_blob(1542, updated_sec=1545),),
+            )
+            writer.commit()
+
+            self.connections.clear()
+            with patch.object(statusline.sqlite3, "connect", self.capture_connection):
+                turn_sec, session_sec, is_active = statusline.get_work_durations(
+                    {"session_id": "session"},
+                    is_state_active=False,
+                    _now=1565,
+                )
+            self.assertEqual(len(self.connections), 1)
+            self.assert_connections_closed()
+            self.assertTrue(is_active)
+            self.assertEqual(turn_sec, 65.0)
+            self.assertEqual(session_sec, 565.0)
+
+    def test_corrupted_blobs_and_path_traversal_fail_safely(self):
+        with contextlib.closing(self.real_connect(self.database)) as writer:
+            writer.execute("CREATE TABLE trajectory_metadata_blob (id TEXT, data BLOB)")
+            writer.execute(
+                "CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, metadata BLOB)"
+            )
+            writer.execute(
+                "INSERT INTO trajectory_metadata_blob VALUES ('main', ?)",
+                (b"\x12\xff\xff\xff",),
+            )
+            writer.execute(
+                "INSERT INTO steps VALUES (0, 15, 3, ?)",
+                (b"\x0a\x0c\x08\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80\x01",),
+            )
+            writer.commit()
+
+        turn_sec, session_sec, is_active = statusline.get_work_durations(
+            {"session_id": "session"}, _now=2000
+        )
+        self.assertIsNone(turn_sec)
+        self.assertIsNone(session_sec)
+        self.assertFalse(is_active)
+
+        with patch.object(statusline.sqlite3, "connect", self.capture_connection):
+            self.assertEqual(
+                statusline.get_upstream_response_model({"session_id": "../session"}), ""
+            )
+        self.assertEqual(self.connections, [])
+
+
+class DurationFormattingTests(unittest.TestCase):
+    def test_format_duration_tiers_and_invalid_inputs(self):
+        self.assertEqual(statusline.format_duration(0), "0s")
+        self.assertEqual(statusline.format_duration(42.9), "42s")
+        self.assertEqual(statusline.format_duration(60), "1m 00s")
+        self.assertEqual(statusline.format_duration(65), "1m 05s")
+        self.assertEqual(statusline.format_duration(3600), "1h 00m")
+        self.assertEqual(statusline.format_duration(3900), "1h 05m")
+        self.assertEqual(statusline.format_duration(97200), "1d 3h")
+
+        for invalid in (None, True, False, -1, float("nan"), float("inf"), "invalid"):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(statusline.format_duration(invalid), "")
+
+    def test_json_duration_payloads_and_empty_omission(self):
+        empty_output = statusline.render_statusline({})
+        self.assertNotIn("⏱️", empty_output)
+
+        session_only_line1 = statusline.render_statusline(
+            {"cost": {"total_duration_ms": 45000}}
+        ).splitlines()[0]
+        self.assertIn(f"⏱️ {statusline.CYAN}45s{statusline.RESET}", session_only_line1)
+        self.assertNotIn("/", session_only_line1)
+
+        with patch.object(statusline.sqlite3, "connect") as mock_connect:
+            explicit_both = statusline.render_statusline(
+                {
+                    "model": {"display_name": "Gemini 4 Argon", "response_model": "argon"},
+                    "agent_state": "reviewing",
+                    "session": {"turn_duration_seconds": 42, "duration_seconds": 1110},
+                }
+            )
+        mock_connect.assert_not_called()
+        self.assertIn(f"⏱️ {statusline.YELLOW}42s{statusline.RESET}", explicit_both)
+        self.assertIn("/ 18m 30s", explicit_both)
 
 
 class InstallationTests(unittest.TestCase):

@@ -5,7 +5,7 @@ A sleek, real-time two-line HUD statusline for **Google Antigravity CLI (`agy`)*
 [English](README.md) | [中文说明](README_zh.md)
 
 ```text
-🤖 4 Argon (High) [gemini-4-argon-trial] │ 📁 my-project │ 🌿 main │ ⚡ reviewing
+🤖 4 Argon (High) [gemini-4-argon-trial] │ 📁 my-project │ 🌿 main │ ⚡ reviewing │ ⏱️ 42s / 18m 30s
 🧠 Context ██░░░░░░░░ 244.6k/1.0M (24.5%) │ ⏳ 5h: 95% (4h 56m) │ 📅 Wk: 99% (167h 56m)
 ```
 
@@ -17,13 +17,14 @@ A sleek, real-time two-line HUD statusline for **Google Antigravity CLI (`agy`)*
 - 📁 **Workspace Awareness** — Displays the current working directory.
 - 🌿 **Ultra-fast Git Detection** — Reads `.git/HEAD` directly by walking parent directories (supports standard repos, worktrees, and submodules). **Zero subprocess spawning**, eliminating lag.
 - ⚡ **Agent State Display** — Live agent lifecycle state (`idle`, `ready`, `reviewing`, etc.) with dynamic color coding.
+- ⏱️ **Turn & Session Duration Tracking** — Displays both the **current/latest turn duration** and **total session elapsed duration** (`⏱️ 42s / 18m 30s`), ticking live while the agent works and freezing the turn stopwatch once idle.
 - 🧠 **Context Window Progress Bar** — Visual token usage meter (`██░░░░░░░░`) with color-coded safety tiers:
   - 🟢 Green (< 60%)
   - 🟡 Yellow (60% - 85%)
   - 🔴 Red (≥ 85%)
 - ⏳ **5-Hour Quota Tracker** — Real-time rolling quota percentage and countdown to quota reset (e.g., `95% (4h 56m)`).
 - 📅 **Weekly Quota Tracker** — Weekly quota percentage and reset countdown (e.g., `99% (167h 56m)`).
-- 🪶 **Zero Dependencies** — Built entirely with standard library Python (`sys`, `json`, `os`). Works out-of-the-box on Windows, macOS, and Linux.
+- 🪶 **Zero Dependencies** — Built entirely with standard library Python (`sys`, `json`, `os`, `sqlite3`, `time`). Works out-of-the-box on Windows, macOS, and Linux.
 
 ---
 
@@ -83,11 +84,11 @@ python -S statusline.py --preview
 
 Output:
 ```text
-🤖 3.8 Flash (High) │ 📁 agy-statusline │ 🌿 main │ ⚡ reviewing
+🤖 4 Argon (High) [gemini-4-argon-trial] │ 📁 agy-statusline │ 🌿 main │ ⚡ reviewing │ ⏱️ 42s / 18m 30s
 🧠 Context ██░░░░░░░░ 244.6k/1.0M (24.5%) │ ⏳ 5h: 95% (4h 56m) │ 📅 Wk: 99% (167h 56m)
 ```
 
-Run the regression checks for WAL reads, connection cleanup, and installed command execution:
+Run the regression checks for WAL reads, connection cleanup, duration tracking, and installed command execution:
 
 ```bash
 python -S -m unittest -v
@@ -98,9 +99,10 @@ python -S -m unittest -v
 ## 🛠️ How It Works
 
 Google Antigravity CLI (`agy`) supports custom status lines by streaming a JSON state snapshot to `stdin` on every turn. `statusline.py` parses:
-- `model`: Model configuration and display name
+- `model`: Model configuration, display name, and read-only upstream `response_model` from `gen_metadata`
 - `cwd` / `workspace`: Active project directory
 - `agent_state`: Current agent execution phase
+- `session` / `turn` / trajectory `steps`: Current turn duration and total session elapsed time (queried in the same single read-only SQLite pass)
 - `context_window`: Token usage, maximum context limit, and percentage
 - `quota`: 5-hour rolling and weekly rate limits and countdown seconds
 
