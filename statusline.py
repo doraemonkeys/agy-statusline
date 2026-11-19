@@ -7,6 +7,7 @@ import json
 import math
 import os
 import sqlite3
+import threading
 import time
 from contextlib import closing
 from pathlib import Path
@@ -14,8 +15,6 @@ from pathlib import Path
 # Ensure UTF-8 output across Windows, macOS, and Linux
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-if hasattr(sys.stdin, "reconfigure"):
-    sys.stdin.reconfigure(encoding="utf-8", errors="replace")
 
 # ANSI Color Codes
 RESET = "\033[0m"
@@ -732,6 +731,40 @@ def render_statusline(data, _now=None):
     return f"{line1}\n{line2}"
 
 
+_STDIN_READ_TIMEOUT_SECONDS = 1.0
+
+
+def _read_stdin():
+    """Collect the hook payload until EOF or the input deadline."""
+    # Raw reads let Python finalize stdin even if the daemon thread is blocked.
+    raw_stdin = sys.stdin.buffer.raw
+    data = bytearray()
+    data_lock = threading.Lock()
+    stop_reading = threading.Event()
+
+    def read_chunks():
+        try:
+            while True:
+                chunk = raw_stdin.read(64 * 1024)
+                if not chunk:
+                    break
+                with data_lock:
+                    if stop_reading.is_set():
+                        break
+                    data.extend(chunk)
+        except OSError:
+            with data_lock:
+                data.clear()
+        finally:
+            stop_reading.set()
+
+    threading.Thread(target=read_chunks, daemon=True).start()
+    stop_reading.wait(_STDIN_READ_TIMEOUT_SECONDS)
+    with data_lock:
+        stop_reading.set()
+        return data.decode("utf-8", errors="replace")
+
+
 def main():
     # Preview / test mode
     if len(sys.argv) > 1 and sys.argv[1] in ("--test", "-t", "--preview"):
@@ -769,7 +802,7 @@ def main():
         return
 
     try:
-        raw = sys.stdin.read()
+        raw = _read_stdin()
         if not raw or not raw.strip():
             print("🧠 Context: Ready")
             return

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -298,6 +299,52 @@ class ExecutionModeTests(unittest.TestCase):
                     statusline.render_statusline({**data, "cycle_mode": mode}),
                     expected,
                 )
+
+
+class StatuslineInputTests(unittest.TestCase):
+    command = [sys.executable, "-S", statusline.__file__]
+
+    def test_reads_complete_utf8_payload_across_chunks(self):
+        data = {"padding": "x" * 160_000, "model": "Gemini 輸入"}
+        completed = subprocess.run(
+            self.command,
+            input=json.dumps(data, ensure_ascii=False).encode("utf-8"),
+            capture_output=True,
+            check=True,
+            timeout=4,
+        )
+        self.assertEqual(completed.stderr, b"")
+        self.assertEqual(
+            completed.stdout.decode("utf-8").splitlines(),
+            statusline.render_statusline(data).splitlines(),
+        )
+
+    def test_exits_when_stdin_stays_open(self):
+        data = {"model": "Gemini 輸入"}
+        payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        ready = ["🧠 Context: Ready"]
+        for label, raw, expected in (
+            ("complete JSON", payload, statusline.render_statusline(data).splitlines()),
+            ("empty input", b"", ready),
+            ("incomplete JSON", b'{"model":', ready),
+        ):
+            with self.subTest(label=label):
+                with subprocess.Popen(
+                    self.command,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                ) as process:
+                    try:
+                        process.stdin.write(raw)
+                        process.stdin.flush()
+                        self.assertEqual(process.wait(timeout=4), 0)
+                        self.assertEqual(process.stderr.read(), b"")
+                        output = process.stdout.read().decode("utf-8")
+                        self.assertEqual(output.splitlines(), expected)
+                    finally:
+                        if process.poll() is None:
+                            process.kill()
 
 
 class InstallationTests(unittest.TestCase):
