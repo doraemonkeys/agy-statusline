@@ -275,6 +275,31 @@ class DurationFormattingTests(unittest.TestCase):
         self.assertIn("/ 18m 30s", explicit_both)
 
 
+class ExecutionModeTests(unittest.TestCase):
+    def test_displays_reported_modes_next_to_agent_state(self):
+        for mode in ("plan", "auto", "accept-edits"):
+            with self.subTest(mode=mode):
+                line1, _ = statusline.render_statusline(
+                    {"agent_state": "idle", "cycle_mode": mode}
+                ).splitlines()
+                self.assertIn(
+                    f"{statusline.GREEN}idle{statusline.RESET} "
+                    f"{statusline.GRAY}·{statusline.RESET} "
+                    f"{statusline.CYAN}[{mode}]{statusline.RESET}",
+                    line1,
+                )
+
+    def test_missing_or_unrecognized_mode_keeps_existing_layout(self):
+        data = {"agent_state": "idle"}
+        expected = statusline.render_statusline(data)
+        for mode in (None, "", "unknown", ["plan"]):
+            with self.subTest(mode=mode):
+                self.assertEqual(
+                    statusline.render_statusline({**data, "cycle_mode": mode}),
+                    expected,
+                )
+
+
 class InstallationTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="agy-install-test-")

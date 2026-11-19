@@ -560,7 +560,7 @@ def get_work_durations(data, is_state_active=False, _db_info=_UNSET, _now=None):
 
 def render_statusline(data, _now=None):
     """Render the 2-line HUD status string from Antigravity state data."""
-    # === 1. Line 1: Model, Directory, Git Branch, Agent State, Working Duration ===
+    # === 1. Line 1: Model, Directory, Git Branch, Agent State and Mode, Working Duration ===
     line1_items = []
 
     # (1) Model Name & Upstream Response Model
@@ -620,12 +620,16 @@ def render_statusline(data, _now=None):
     if branch:
         line1_items.append(f"🌿 {MAGENTA}{branch}{RESET}")
 
-    # (4) Agent State
+    # (4) Agent State and Execution Mode
     raw_state = data.get("agent_state")
     agent_state = raw_state.strip() if isinstance(raw_state, str) and raw_state.strip() else "Idle"
     is_state_active = agent_state.lower() not in _IDLE_AGENT_STATES
     state_color = YELLOW if is_state_active else GREEN
-    line1_items.append(f"⚡ {state_color}{agent_state}{RESET}")
+    state_item = f"⚡ {state_color}{agent_state}{RESET}"
+    cycle_mode = data.get("cycle_mode")
+    if cycle_mode in ("plan", "auto", "accept-edits"):
+        state_item += f" {GRAY}·{RESET} {CYAN}[{cycle_mode}]{RESET}"
+    line1_items.append(state_item)
 
     # (5) Working Duration: Current Turn / Total Session
     turn_sec, session_sec, is_turn_active = get_work_durations(
@@ -739,6 +743,7 @@ def main():
             "cwd": os.getcwd(),
             "vcs": {"branch": get_git_branch(os.getcwd()) or "main"},
             "agent_state": "reviewing",
+            "cycle_mode": "plan",
             "session": {
                 "turn_duration_seconds": 42,
                 "duration_seconds": 1110,
