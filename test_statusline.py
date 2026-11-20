@@ -301,6 +301,135 @@ class ExecutionModeTests(unittest.TestCase):
                 )
 
 
+class QuotaSelectionTests(unittest.TestCase):
+    MULTI_GROUP_QUOTA = {
+        "3p-5h": {"remaining_fraction": 1.0, "reset_in_seconds": 18000},
+        "3p-weekly": {"remaining_fraction": 0.84, "reset_in_seconds": 604800},
+        "gemini-5h": {"remaining_fraction": 0.9032, "reset_in_seconds": 10037},
+        "gemini-weekly": {"remaining_fraction": 0.9667, "reset_in_seconds": 407635},
+    }
+
+    def test_matches_third_party_models_to_3p_buckets(self):
+        for model in (
+            {"id": "Claude Opus 5.5 (High)", "display_name": "Claude Opus 5.5 (High)"},
+            {"id": "Claude Sonnet 5.5 (Low)", "display_name": "Claude Sonnet 5.5 (Low)"},
+            {"id": "GPT-OSS 120B (Medium)", "display_name": "GPT-OSS 120B (Medium)"},
+            {"id": "claude-opus-5-5-high", "display_name": "Custom Alias"},
+        ):
+            with self.subTest(model=model):
+                _, line2 = statusline.render_statusline(
+                    {"model": model, "quota": self.MULTI_GROUP_QUOTA}
+                ).splitlines()
+                self.assertIn(f"⏳ 5h: {statusline.GREEN}100%{statusline.RESET}", line2)
+                self.assertIn("(5h 0m)", line2)
+                self.assertIn(f"📅 Wk: {statusline.GREEN}84%{statusline.RESET}", line2)
+                self.assertIn("(168h 0m)", line2)
+
+    def test_matches_gemini_and_orchestrator_models_to_gemini_buckets(self):
+        for model in (
+            {"id": "Gemini 4 Neon (XHigh)", "display_name": "Gemini 4 Neon (XHigh)"},
+            {"id": "Gemini 3.8 Flash (High)", "display_name": "Gemini 3.8 Flash (High)"},
+            {"id": "Orchestrator (Neon)", "display_name": "Orchestrator (Neon)"},
+        ):
+            with self.subTest(model=model):
+                _, line2 = statusline.render_statusline(
+                    {"model": model, "quota": self.MULTI_GROUP_QUOTA}
+                ).splitlines()
+                self.assertIn(f"⏳ 5h: {statusline.GREEN}90%{statusline.RESET}", line2)
+                self.assertIn("(2h 47m)", line2)
+                self.assertIn(f"📅 Wk: {statusline.GREEN}97%{statusline.RESET}", line2)
+                self.assertIn("(113h 13m)", line2)
+
+    def test_prefers_specific_subgroups_when_available(self):
+        split_quota = {
+            "3p-5h": {"remaining_fraction": 1.0, "reset_in_seconds": 18000},
+            "gemini-flash-5h": {"remaining_fraction": 0.72, "reset_in_seconds": 7200},
+            "gemini-pro-5h": {"remaining_fraction": 0.41, "reset_in_seconds": 3600},
+            "gemini-5h": {"remaining_fraction": 0.55, "reset_in_seconds": 5400},
+        }
+        flash_5h, _ = statusline.select_model_quotas(
+            split_quota, model_name="Gemini 3.8 Flash (High)"
+        )
+        self.assertEqual(flash_5h["remaining_fraction"], 0.72)
+
+        # Without a bare 'gemini' bucket, non-flash Gemini prefers 'gemini-pro'.
+        no_bare = {k: v for k, v in split_quota.items() if k != "gemini-5h"}
+        neon_5h, _ = statusline.select_model_quotas(
+            no_bare, model_name="Gemini 4 Neon (XHigh)"
+        )
+        self.assertEqual(neon_5h["remaining_fraction"], 0.41)
+
+    def test_disabled_buckets_and_cross_family_mismatch_do_not_leak(self):
+        disabled_3p = {
+            "3p-5h": {"remaining_fraction": 1.0, "disabled": True},
+            "3p-weekly": {"remaining_fraction": 1.0, "disabled": True},
+            "gemini-5h": {"remaining_fraction": 0.50, "reset_in_seconds": 3600},
+            "gemini-weekly": {"remaining_fraction": 0.80, "reset_in_seconds": 7200},
+        }
+        _, line2 = statusline.render_statusline(
+            {"model": {"display_name": "Claude Opus 5.5 (High)"}, "quota": disabled_3p}
+        ).splitlines()
+        self.assertNotIn("⏳ 5h:", line2)
+        self.assertNotIn("📅 Wk:", line2)
+
+        # Partial disable keeps the enabled window from the matching group only.
+        partial_3p = {
+            **disabled_3p,
+            "3p-weekly": {"remaining_fraction": 0.75, "reset_in_seconds": 7200},
+        }
+        five_h, weekly = statusline.select_model_quotas(
+            partial_3p, model_name="Claude Opus 5.5 (High)"
+        )
+        self.assertIsNone(five_h)
+        self.assertEqual(weekly["remaining_fraction"], 0.75)
+
+        # Single-group Gemini payload must not render under a 3p model.
+        gemini_only = {
+            "gemini-5h": {"remaining_fraction": 0.50, "reset_in_seconds": 3600},
+            "gemini-weekly": {"remaining_fraction": 0.80, "reset_in_seconds": 7200},
+        }
+        self.assertEqual(
+            statusline.select_model_quotas(gemini_only, model_name="Claude Opus 5.5 (High)"),
+            (None, None),
+        )
+
+    def test_preserves_unprefixed_single_group_and_ambiguous_omission(self):
+        legacy = {
+            "five_hour": {"remaining_fraction": 0.95, "reset_in_seconds": 17760},
+            "weekly": {"remaining_fraction": 0.99, "reset_in_seconds": 604560},
+        }
+        for model_name in ("", "Claude Opus 5.5 (High)", "Gemini 4 Argon (High)", "Unknown Model"):
+            with self.subTest(model_name=model_name):
+                five_h, weekly = statusline.select_model_quotas(legacy, model_name=model_name)
+                self.assertEqual(five_h["remaining_fraction"], 0.95)
+                self.assertEqual(weekly["remaining_fraction"], 0.99)
+
+        # Omitted model with single prefixed group still renders (official doc shape).
+        doc_example = {"gemini-weekly": {"remaining_fraction": 0.9378, "reset_in_seconds": 560580}}
+        _, line2 = statusline.render_statusline({"quota": doc_example}).splitlines()
+        self.assertIn(f"📅 Wk: {statusline.GREEN}94%{statusline.RESET}", line2)
+
+        # Ambiguous multi-group payload with unknown or omitted model omits quota safely.
+        for model_name in ("", "Mystery Model 1.0"):
+            with self.subTest(ambiguous_model=model_name):
+                self.assertEqual(
+                    statusline.select_model_quotas(self.MULTI_GROUP_QUOTA, model_name=model_name),
+                    (None, None),
+                )
+
+    def test_zero_remaining_and_non_positive_reset_seconds(self):
+        exhausted = {
+            "3p-5h": {"remaining_fraction": 0, "reset_in_seconds": -5},
+            "3p-weekly": {"remaining_fraction": 0.15, "reset_in_seconds": 0},
+        }
+        _, line2 = statusline.render_statusline(
+            {"model": {"display_name": "Claude Opus 5.5 (High)"}, "quota": exhausted}
+        ).splitlines()
+        self.assertIn(f"⏳ 5h: {statusline.RED}0%{statusline.RESET}", line2)
+        self.assertNotIn("()", line2)
+        self.assertIn(f"📅 Wk: {statusline.YELLOW}15%{statusline.RESET}", line2)
+
+
 class StatuslineInputTests(unittest.TestCase):
     command = [sys.executable, "-S", statusline.__file__]
 

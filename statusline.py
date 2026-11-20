@@ -557,6 +557,257 @@ def get_work_durations(data, is_state_active=False, _db_info=_UNSET, _now=None):
     return turn_sec, session_sec, is_turn_active
 
 
+_QUOTA_FIVE_HOUR_TOKENS = frozenset({"5h", "fivehour"})
+_QUOTA_WEEKLY_TOKENS = frozenset({"weekly", "week", "7d"})
+_QUOTA_FALLBACK_FIVE_HOUR_TOKENS = frozenset({"short"})
+_QUOTA_FALLBACK_WEEKLY_TOKENS = frozenset({"long"})
+_QUOTA_NOISE_TOKENS = frozenset({"quota", "quotas", "limit", "limits", "window", "bucket", "term"})
+
+_THIRD_PARTY_MODEL_TOKENS = frozenset({
+    "claude",
+    "opus",
+    "sonnet",
+    "haiku",
+    "anthropic",
+    "gpt",
+    "openai",
+    "chatgpt",
+    "o1",
+    "o3",
+    "o4",
+    "deepseek",
+    "llama",
+    "mistral",
+    "qwen",
+    "grok",
+})
+_THIRD_PARTY_MODEL_PREFIXES = ("claude", "gpt")
+_GEMINI_MODEL_TOKENS = frozenset({"gemini", "orchestrator", "gemma"})
+
+_THIRD_PARTY_GROUP_ALIASES = ("3p", "third-party", "thirdparty")
+_GEMINI_FLASH_GROUP_ALIASES = ("gemini-flash", "flash", "gemini")
+_GEMINI_PRO_GROUP_ALIASES = ("gemini-pro", "pro", "gemini")
+
+
+def _tokenize_identifier(text):
+    """Split an identifier or display label into lowercase alphanumeric tokens."""
+    if not text or not isinstance(text, str):
+        return ()
+    tokens = []
+    cur = []
+    for ch in text.lower():
+        if ch.isalnum():
+            cur.append(ch)
+        elif cur:
+            tokens.append("".join(cur))
+            cur = []
+    if cur:
+        tokens.append("".join(cur))
+    return tuple(tokens)
+
+
+def _parse_quota_key(key):
+    """
+    Parse a quota bucket key into (group_name, window_name).
+    Examples:
+      '3p-5h'           -> ('3p', 'five_hour')
+      'gemini-weekly'   -> ('gemini', 'weekly')
+      'gemini-flash-5h' -> ('gemini-flash', 'five_hour')
+      'five_hour'       -> ('', 'five_hour')
+    """
+    tokens = _tokenize_identifier(str(key))
+    window = None
+    remaining = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "five" and i + 1 < len(tokens) and tokens[i + 1] == "hour":
+            if window is None:
+                window = "five_hour"
+            i += 2
+            continue
+        if tok in _QUOTA_FIVE_HOUR_TOKENS:
+            if window is None:
+                window = "five_hour"
+            i += 1
+            continue
+        if tok in _QUOTA_WEEKLY_TOKENS:
+            if window is None:
+                window = "weekly"
+            i += 1
+            continue
+        remaining.append(tok)
+        i += 1
+
+    if window is None:
+        fallback_remaining = []
+        for tok in remaining:
+            if tok in _QUOTA_FALLBACK_FIVE_HOUR_TOKENS:
+                if window is None:
+                    window = "five_hour"
+                continue
+            if tok in _QUOTA_FALLBACK_WEEKLY_TOKENS:
+                if window is None:
+                    window = "weekly"
+                continue
+            fallback_remaining.append(tok)
+        remaining = fallback_remaining
+
+    group_tokens = [tok for tok in remaining if tok not in _QUOTA_NOISE_TOKENS]
+    return "-".join(group_tokens), window
+
+
+def _is_valid_quota_entry(val):
+    """Return True if val is an enabled quota entry with a finite remaining_fraction."""
+    if not isinstance(val, dict) or val.get("disabled") is True:
+        return False
+    rem_frac = val.get("remaining_fraction")
+    if rem_frac is None or isinstance(rem_frac, bool):
+        return False
+    try:
+        return math.isfinite(float(rem_frac))
+    except Exception:
+        return False
+
+
+def _classify_model_family(tokens):
+    """Classify tokenized model identifiers into '3p', 'gemini', or None."""
+    if not tokens:
+        return None
+    if (tokens & _THIRD_PARTY_MODEL_TOKENS) or any(
+        tok.startswith(_THIRD_PARTY_MODEL_PREFIXES) for tok in tokens
+    ):
+        return "3p"
+    if tokens & _GEMINI_MODEL_TOKENS:
+        return "gemini"
+    return None
+
+
+def _classify_group_family(group):
+    """Classify a normalized quota group name into '3p', 'gemini', or None."""
+    if not group:
+        return None
+    group_tokens = set(_tokenize_identifier(group))
+    if (
+        group in _THIRD_PARTY_GROUP_ALIASES
+        or (group_tokens & _THIRD_PARTY_MODEL_TOKENS)
+        or any(tok.startswith(_THIRD_PARTY_MODEL_PREFIXES) for tok in group_tokens)
+    ):
+        return "3p"
+    if (group_tokens & _GEMINI_MODEL_TOKENS) or group in ("flash", "pro"):
+        return "gemini"
+    return None
+
+
+def _find_direct_group_match(groups, model_tokens):
+    """
+    Pick the most specific non-empty quota group whose tokens all appear in
+    model_tokens (e.g. 'gemini-flash' beats 'gemini' for 'Gemini 3.8 Flash').
+    """
+    if not model_tokens:
+        return None
+    best_group = None
+    best_score = 0
+    for group in sorted(groups):
+        if not group:
+            continue
+        group_tokens = _tokenize_identifier(group)
+        if not group_tokens:
+            continue
+        if all(tok in model_tokens for tok in group_tokens):
+            score = len(group_tokens)
+            if score > best_score:
+                best_score = score
+                best_group = group
+    return best_group
+
+
+def select_model_quotas(quotas, model_name="", response_model=""):
+    """
+    Select (five_hour_info, weekly_info) matching the active model's quota group.
+    Handles multi-group payloads (e.g. '3p-*' and 'gemini-*') without letting
+    key ordering overwrite one model family's quota with another's.
+    """
+    if not isinstance(quotas, dict):
+        return None, None
+
+    groups = {}
+    seen_groups = set()
+    unclassified = []
+
+    for key, val in quotas.items():
+        if not isinstance(val, dict):
+            continue
+        group, window = _parse_quota_key(key)
+        if window is not None:
+            seen_groups.add(group)
+        if not _is_valid_quota_entry(val):
+            continue
+        if window is not None:
+            bucket = groups.setdefault(group, {"five_hour": None, "weekly": None})
+            if bucket[window] is None:
+                bucket[window] = val
+        else:
+            unclassified.append(val)
+
+    if not groups:
+        if unclassified:
+            first = unclassified[0]
+            second = unclassified[1] if len(unclassified) > 1 else None
+            return first, second
+        return None, None
+
+    primary_tokens = set(_tokenize_identifier(model_name))
+    secondary_tokens = set(_tokenize_identifier(response_model))
+    primary_family = _classify_model_family(primary_tokens)
+    secondary_family = _classify_model_family(secondary_tokens)
+
+    # Combine response_model hints unless they contradict the active display model.
+    if primary_family is None or secondary_family is None or secondary_family == primary_family:
+        effective_tokens = primary_tokens | secondary_tokens
+    else:
+        effective_tokens = primary_tokens
+
+    model_family = primary_family or secondary_family
+
+    # 1. Exact/sub-group token match (e.g. 'gemini-flash' or 'claude').
+    matched_group = _find_direct_group_match(groups, effective_tokens)
+    if matched_group is not None:
+        selected = groups[matched_group]
+        return selected["five_hour"], selected["weekly"]
+
+    # 2. Known family alias lookup (e.g. Claude/GPT -> '3p', Orchestrator/Neon -> 'gemini').
+    if model_family == "3p":
+        candidates = _THIRD_PARTY_GROUP_ALIASES
+    elif model_family == "gemini":
+        candidates = (
+            _GEMINI_FLASH_GROUP_ALIASES
+            if "flash" in effective_tokens
+            else _GEMINI_PRO_GROUP_ALIASES
+        )
+    else:
+        candidates = ()
+
+    for candidate in candidates:
+        if candidate in groups:
+            selected = groups[candidate]
+            return selected["five_hour"], selected["weekly"]
+
+    # 3. Unprefixed generic buckets (e.g. legacy 'five_hour' / 'weekly') apply to any model.
+    if "" in groups:
+        selected = groups[""]
+        return selected["five_hour"], selected["weekly"]
+
+    # 4. Single-group payload fallback only when it does not conflict with model_family.
+    if len(seen_groups) == 1 and len(groups) == 1:
+        sole_group, selected = next(iter(groups.items()))
+        sole_family = _classify_group_family(sole_group)
+        if model_family is None or sole_family is None or sole_family == model_family:
+            return selected["five_hour"], selected["weekly"]
+
+    return None, None
+
+
 def render_statusline(data, _now=None):
     """Render the 2-line HUD status string from Antigravity state data."""
     # === 1. Line 1: Model, Directory, Git Branch, Agent State and Mode, Working Duration ===
@@ -564,16 +815,24 @@ def render_statusline(data, _now=None):
 
     # (1) Model Name & Upstream Response Model
     model_info = data.get("model")
-    model_name = "Gemini"
+    reported_model_name = ""
+    reported_model_id = ""
     explicit_resp_model = ""
     if isinstance(model_info, dict):
-        raw_model = model_info.get("display_name") or model_info.get("id")
-        if raw_model is not None and str(raw_model).strip():
-            model_name = str(raw_model).strip()
+        raw_display = model_info.get("display_name")
+        raw_id = model_info.get("id")
+        if raw_display is not None and str(raw_display).strip():
+            reported_model_name = str(raw_display).strip()
+        if raw_id is not None and str(raw_id).strip():
+            reported_model_id = str(raw_id).strip()
+        if not reported_model_name:
+            reported_model_name = reported_model_id
         if model_info.get("response_model"):
             explicit_resp_model = str(model_info["response_model"]).strip()
     elif isinstance(model_info, str) and model_info.strip():
-        model_name = model_info.strip()
+        reported_model_name = model_info.strip()
+
+    model_name = reported_model_name or "Gemini"
 
     # Simplify model name (e.g. Gemini 3.8 Flash (High) -> 3.8 Flash (High))
     clean_model = model_name.replace("Gemini", "").replace("Google", "").strip()
@@ -596,7 +855,7 @@ def render_statusline(data, _now=None):
             db_info = _query_conversation_db(
                 db_path,
                 need_model=need_model,
-                expected_display_name=model_name,
+                expected_display_name=reported_model_name,
                 need_timing=need_timing,
             )
 
@@ -682,49 +941,35 @@ def render_statusline(data, _now=None):
         f"🧠 {BOLD}Context{RESET} {progress_bar} {format_tokens(total_tokens)}/{format_tokens(max_tokens)} ({used_pct:.1f}%)"
     )
 
-    # (2) Quotas: 5h & Weekly
+    # (2) Quotas: 5h & Weekly (scoped to the active model's quota group)
     quotas = data.get("quota") or data.get("quotas") or {}
-    five_hour_info = None
-    weekly_info = None
+    quota_model_hint = reported_model_name
+    if reported_model_id and reported_model_id != reported_model_name:
+        quota_model_hint = f"{reported_model_name} {reported_model_id}".strip()
+    five_hour_info, weekly_info = select_model_quotas(
+        quotas,
+        model_name=quota_model_hint,
+        response_model=response_model,
+    )
 
-    if isinstance(quotas, dict):
-        for key, val in quotas.items():
-            if not isinstance(val, dict):
-                continue
-            k = str(key).lower()
-            if "five_hour" in k or "5h" in k or "short" in k:
-                five_hour_info = val
-            elif "week" in k or "7d" in k or "long" in k:
-                weekly_info = val
-            elif "remaining_fraction" in val:
-                if five_hour_info is None:
-                    five_hour_info = val
-                elif weekly_info is None:
-                    weekly_info = val
-
-    if isinstance(five_hour_info, dict):
-        rem_frac = five_hour_info.get("remaining_fraction")
-        if rem_frac is not None:
-            try:
-                pct = float(rem_frac) * 100
-                res_sec = five_hour_info.get("reset_in_seconds", 0)
-                res_str = f" {GRAY}({format_time_remaining(res_sec)}){RESET}" if res_sec else ""
-                color = GREEN if pct > 30 else (YELLOW if pct > 10 else RED)
-                line2_items.append(f"⏳ 5h: {color}{pct:.0f}%{RESET}{res_str}")
-            except Exception:
-                pass
-
-    if isinstance(weekly_info, dict):
-        rem_frac = weekly_info.get("remaining_fraction")
-        if rem_frac is not None:
-            try:
-                pct = float(rem_frac) * 100
-                res_sec = weekly_info.get("reset_in_seconds", 0)
-                res_str = f" {GRAY}({format_time_remaining(res_sec)}){RESET}" if res_sec else ""
-                color = GREEN if pct > 30 else (YELLOW if pct > 10 else RED)
-                line2_items.append(f"📅 Wk: {color}{pct:.0f}%{RESET}{res_str}")
-            except Exception:
-                pass
+    for icon, label, info in (
+        ("⏳", "5h", five_hour_info),
+        ("📅", "Wk", weekly_info),
+    ):
+        if isinstance(info, dict):
+            rem_frac = info.get("remaining_fraction")
+            if rem_frac is not None and not isinstance(rem_frac, bool):
+                try:
+                    pct = float(rem_frac) * 100
+                    if not math.isfinite(pct):
+                        continue
+                    res_sec = info.get("reset_in_seconds", 0)
+                    res_text = format_time_remaining(res_sec) if res_sec else ""
+                    res_str = f" {GRAY}({res_text}){RESET}" if res_text else ""
+                    color = GREEN if pct > 30 else (YELLOW if pct > 10 else RED)
+                    line2_items.append(f"{icon} {label}: {color}{pct:.0f}%{RESET}{res_str}")
+                except Exception:
+                    pass
 
     line2 = f" {GRAY}│{RESET} ".join(line2_items)
 
