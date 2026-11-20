@@ -44,9 +44,9 @@ A sleek, real-time two-line HUD statusline for **Google Antigravity CLI (`agy`)*
    ```
 
 The script will automatically:
-- Copy `statusline.py` into `~/.gemini/antigravity-cli/statusline.py`
+- Copy `statusline.py` atomically into `~/.gemini/antigravity-cli/statusline.py`
 - Pin the installing Python interpreter's absolute path and use `-S` to skip site initialization
-- On Windows, create `statusline.cmd` to handle the CLI's command quoting correctly
+- On Windows, launch `python.exe -S statusline.py` directly when both paths are `cmd /c`-safe (avoiding batch wrapper file locks), and automatically fall back to a minimal `statusline.cmd` launcher only when paths contain spaces or `cmd.exe` metacharacters
 - Validate the installed command before saving settings, and back up the existing configuration
 - Configure the `"statusLine"` command hook while preserving other settings
 
@@ -70,7 +70,7 @@ Requires Python 3.8 or newer. Rerun the installer after moving or removing the p
    }
    ```
 
-   Replace the example paths, and shell-quote each path if it contains spaces or special characters. On Windows, use the automatic installer: it generates a batch launcher and the necessary command escaping instead of embedding quoted Python arguments in the CLI configuration.
+   Replace the example paths, and shell-quote each path if it contains spaces or special characters. On Windows, you can use the same unquoted `C:\...\python.exe -S C:\...\statusline.py` form when neither path contains spaces or `cmd.exe` special characters; otherwise use the automatic installer so it generates a `.cmd` launcher instead of embedding quoted Python arguments in the CLI configuration.
 
 ---
 

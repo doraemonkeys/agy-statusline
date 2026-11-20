@@ -7,6 +7,8 @@ import os
 import sys
 import json
 import shutil
+import stat
+import tempfile
 import time
 import subprocess
 import shlex
@@ -15,10 +17,78 @@ import shlex
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+# Characters that cmd.exe interprets as delimiters, operators, quotes, or
+# variable/wildcard syntax when unquoted on a `cmd /c` command line.
+_WINDOWS_CMD_UNSAFE_CHARS = frozenset('"&|<>()^%!;,=*?')
+_WINDOWS_CMD_ESCAPE_CHARS = frozenset(" ^&|<>(),;=")
+
 
 def get_default_config_dir():
     """Get the default Antigravity CLI directory."""
     return os.path.expanduser("~/.gemini/antigravity-cli")
+
+
+def _is_windows_cmd_token_safe(token):
+    """Return True if token can be passed unquoted to `cmd /c` without shell mangling."""
+    if not token or token.startswith("@") or token.endswith("\\"):
+        return False
+    return not any(
+        ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F or ch in _WINDOWS_CMD_UNSAFE_CHARS
+        for ch in token
+    )
+
+
+def _atomic_write_bytes(path, data):
+    """Atomically write bytes via a same-directory temp file, skipping unchanged files."""
+    try:
+        with open(path, "rb") as existing:
+            if existing.read() == data:
+                return
+    except OSError:
+        pass
+
+    target = os.path.abspath(path)
+    parent = os.path.dirname(target)
+    os.makedirs(parent, exist_ok=True)
+
+    existing_mode = None
+    if os.name != "nt":
+        try:
+            existing_mode = stat.S_IMODE(os.stat(target).st_mode)
+        except OSError:
+            pass
+
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(target)}.",
+        suffix=".tmp",
+        dir=parent,
+    )
+    try:
+        with os.fdopen(fd, "wb") as tmp_file:
+            tmp_file.write(data)
+            tmp_file.flush()
+        if existing_mode is not None:
+            os.chmod(tmp_path, existing_mode)
+        for attempt in range(5):
+            try:
+                os.replace(tmp_path, target)
+                tmp_path = None
+                return
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.02 * (attempt + 1))
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def _atomic_write_text(path, text):
+    """Atomically write UTF-8 text without newline translation."""
+    _atomic_write_bytes(path, text.encode("utf-8"))
 
 
 def get_statusline_command(target_script):
@@ -28,18 +98,31 @@ def get_statusline_command(target_script):
     if os.name != "nt":
         return shlex.join([executable, "-S", target_script])
 
+    # Invoke Python directly whenever both paths are safe unquoted tokens for
+    # `cmd /c`. This avoids creating a `.cmd` batch wrapper that `cmd.exe`
+    # repeatedly opens/closes on every refresh and exposes to AV file locks.
+    if _is_windows_cmd_token_safe(executable) and _is_windows_cmd_token_safe(target_script):
+        return f"{executable} -S {target_script}"
+
     # The Windows CLI passes the command through Go's argv quoting to cmd /c.
-    # Embedded double quotes become literal backslash-quotes. Keep those
-    # quotes inside a batch launcher instead of in the configured command.
+    # Embedded double quotes become literal backslash-quotes. When either path
+    # needs quoting or cmd escaping, keep those quotes inside a minimal batch
+    # launcher instead of in the configured command.
     launcher = os.path.splitext(target_script)[0] + ".cmd"
     script_name = os.path.basename(target_script).replace("%", "%%")
-    with open(launcher, "w", encoding="utf-8", newline="") as f:
-        f.write("@echo off\r\nsetlocal DisableDelayedExpansion\r\n")
-        if not (executable + script_name).isascii():
-            f.write("chcp 65001 >nul\r\n")
-        f.write(f'"{executable.replace("%", "%%")}" -S "%~dp0{script_name}" %*\r\n')
+    escaped_exe = executable.replace("%", "%%")
+    lines = []
+    if not (executable + script_name).isascii():
+        lines.append("@chcp 65001 >nul")
+    lines.append(
+        f'@setlocal DisableDelayedExpansion & "{escaped_exe}" -S "%~dp0{script_name}" %*'
+    )
+    _atomic_write_bytes(launcher, ("\r\n".join(lines) + "\r\n").encode("utf-8"))
 
-    return "".join("^" + char if char in " ^&|<>()" else char for char in launcher)
+    return "".join(
+        "^" + char if char in _WINDOWS_CMD_ESCAPE_CHARS else char
+        for char in launcher
+    )
 
 
 def run_statusline_command(command, **kwargs):
@@ -74,7 +157,8 @@ def install():
             raise ValueError("settings.json must contain a JSON object")
 
     print(f"📦 Copying statusline.py to {target_script} ...")
-    shutil.copy2(source_script, target_script)
+    with open(source_script, "rb") as f:
+        _atomic_write_bytes(target_script, f.read())
     command_str = get_statusline_command(target_script)
 
     # Validate the installed command itself before publishing it to settings.
@@ -97,9 +181,10 @@ def install():
         "enabled": True
     }
 
-    with open(settings_file, "w", encoding="utf-8") as f:
-        json.dump(settings, f, indent=2, ensure_ascii=False)
-        f.write("\n")
+    _atomic_write_text(
+        settings_file,
+        json.dumps(settings, indent=2, ensure_ascii=False) + "\n",
+    )
 
     print(f"✅ Successfully updated {settings_file}")
     print(f"✨ StatusLine command set to: {command_str}")
@@ -123,9 +208,10 @@ def uninstall():
 
     if "statusLine" in settings:
         del settings["statusLine"]
-        with open(settings_file, "w", encoding="utf-8") as f:
-            json.dump(settings, f, indent=2, ensure_ascii=False)
-            f.write("\n")
+        _atomic_write_text(
+            settings_file,
+            json.dumps(settings, indent=2, ensure_ascii=False) + "\n",
+        )
         print(f"✅ Removed statusLine configuration from {settings_file}")
     else:
         print("ℹ️ statusLine was not configured.")

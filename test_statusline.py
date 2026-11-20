@@ -564,6 +564,199 @@ class InstallationTests(unittest.TestCase):
                     installer.install()
         self.assertEqual(json.loads(self.settings.read_text(encoding="utf-8")), self.original)
 
+    def test_windows_cmd_token_safety_rules(self):
+        for safe in (
+            r"C:\Users\h\AppData\Local\mise\installs\python\3.12.13\python.exe",
+            r"C:\Users\h\.gemini\antigravity-cli\statusline.py",
+            r"C:\Users\张三\.gemini\antigravity-cli\statusline.py",
+            r"C:\Users\alice@example.com\statusline.py",
+        ):
+            with self.subTest(safe=safe):
+                self.assertTrue(installer._is_windows_cmd_token_safe(safe))
+
+        for unsafe in (
+            "",
+            r"@C:\Users\h\python.exe",
+            "C:\\Users\\h\\",
+            r"C:\Program Files\Python\python.exe",
+            r"C:\Users\a&b\statusline.py",
+            r"C:\Users\a(b)\statusline.py",
+            r"C:\Users\a,b\statusline.py",
+            r"C:\Users\a;b\statusline.py",
+            r"C:\Users\a=b\statusline.py",
+            r"C:\Users\a%OS%b\statusline.py",
+            r"C:\Users\a!OS!b\statusline.py",
+            r"C:\Users\a^b\statusline.py",
+            "C:\\Users\\a\tb\\statusline.py",
+        ):
+            with self.subTest(unsafe=unsafe):
+                self.assertFalse(installer._is_windows_cmd_token_safe(unsafe))
+
+    @unittest.skipUnless(os.name == "nt", "Windows cmd.exe direct-launch behavior")
+    def test_safe_windows_paths_launch_python_directly_without_cmd_wrapper(self):
+        for label, dir_name, env_name in (
+            ("ascii", "antigravity-cli", "python-runtime"),
+            ("unicode", "antigravity_中文", "python_中文"),
+        ):
+            with self.subTest(label=label):
+                safe_config = self.root / dir_name
+                safe_config.mkdir()
+                safe_settings = safe_config / "settings.json"
+                safe_settings.write_text(json.dumps(self.original), encoding="utf-8")
+
+                environment = self.root / env_name
+                venv.EnvBuilder(with_pip=False).create(environment)
+                executable = environment / "Scripts" / "python.exe"
+
+                with patch.object(
+                    installer, "get_default_config_dir", return_value=str(safe_config)
+                ), patch.object(installer.sys, "executable", str(executable)):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        installer.install()
+
+                settings = json.loads(safe_settings.read_text(encoding="utf-8"))
+                command = settings["statusLine"]["command"]
+                expected_exe = os.path.realpath(executable)
+                expected_script = os.path.abspath(safe_config / "statusline.py")
+                self.assertEqual(command, f"{expected_exe} -S {expected_script}")
+                self.assertFalse((safe_config / "statusline.cmd").exists())
+                self.assertEqual(list(safe_config.glob("*.tmp")), [])
+
+                script = safe_config / "statusline.py"
+                script.write_text(
+                    "import json, sys\n"
+                    "print(json.dumps({'executable': sys.executable, "
+                    "'no_site': sys.flags.no_site, 'site_loaded': 'site' in sys.modules, "
+                    "'input': sys.stdin.read()}))\n",
+                    encoding="utf-8",
+                )
+                fake_path = self.root / f"wrong-python-{label}"
+                fake_path.mkdir()
+                (fake_path / "python.cmd").write_text("@exit /b 99\n", encoding="ascii")
+                env = dict(os.environ, PATH=str(fake_path))
+                payload = '{"check":"direct launch stdin"}'
+                completed = installer.run_statusline_command(
+                    command,
+                    input=payload, encoding="utf-8", capture_output=True,
+                    env=env, check=True, timeout=5,
+                )
+                self.assertEqual(completed.stderr, "")
+                observed = json.loads(completed.stdout)
+                self.assertTrue(os.path.samefile(observed["executable"], executable.resolve()))
+                self.assertEqual(observed["no_site"], 1)
+                self.assertFalse(observed["site_loaded"])
+                self.assertEqual(observed["input"], payload)
+
+                script.write_text("raise SystemExit(7)\n", encoding="utf-8")
+                completed = installer.run_statusline_command(
+                    command, input="", capture_output=True, timeout=5, env=env,
+                )
+                self.assertEqual(completed.returncode, 7)
+
+    @unittest.skipUnless(os.name == "nt", "Windows cmd.exe fallback launcher behavior")
+    def test_windows_cmd_fallback_handles_delimiters_and_delayed_expansion(self):
+        delimiter_config = self.root / "dir,comma;semi=eq & 中文"
+        delimiter_config.mkdir()
+        delimiter_settings = delimiter_config / "settings.json"
+        delimiter_settings.write_text(json.dumps(self.original), encoding="utf-8")
+
+        environment = self.root / "py!OS! & 中文"
+        venv.EnvBuilder(with_pip=False).create(environment)
+        executable = environment / "Scripts" / "python.exe"
+
+        with patch.object(
+            installer, "get_default_config_dir", return_value=str(delimiter_config)
+        ), patch.object(installer.sys, "executable", str(executable)):
+            with contextlib.redirect_stdout(io.StringIO()):
+                installer.install()
+
+        settings = json.loads(delimiter_settings.read_text(encoding="utf-8"))
+        command = settings["statusLine"]["command"]
+        launcher = delimiter_config / "statusline.cmd"
+        self.assertTrue(launcher.is_file())
+        self.assertEqual(len(launcher.read_text(encoding="utf-8").splitlines()), 2)
+
+        script = delimiter_config / "statusline.py"
+        script.write_text(
+            "import sys; print('OK:' + sys.stdin.read().strip())\n",
+            encoding="utf-8",
+        )
+        shell = os.environ.get("COMSPEC", "cmd.exe")
+        completed = subprocess.run(
+            [shell, "/v:on", "/c", command],
+            input='{"ok":1}', encoding="utf-8", capture_output=True,
+            check=True, timeout=5,
+        )
+        self.assertEqual(completed.stderr, "")
+        self.assertEqual(completed.stdout.splitlines(), ['OK:{"ok":1}'])
+
+    @unittest.skipUnless(os.name == "nt", "Windows upgrade preserves legacy launcher for live sessions")
+    def test_upgrade_to_direct_command_preserves_existing_legacy_cmd_file(self):
+        safe_config = self.root / "upgrade-cli"
+        safe_config.mkdir()
+        safe_settings = safe_config / "settings.json"
+        legacy_launcher = safe_config / "statusline.cmd"
+        legacy_launcher.write_bytes(b"@echo legacy\r\n")
+        safe_settings.write_text(
+            json.dumps(
+                {
+                    **self.original,
+                    "statusLine": {
+                        "type": "command",
+                        "command": str(legacy_launcher),
+                        "enabled": True,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        environment = self.root / "upgrade-python"
+        venv.EnvBuilder(with_pip=False).create(environment)
+        executable = environment / "Scripts" / "python.exe"
+
+        with patch.object(
+            installer, "get_default_config_dir", return_value=str(safe_config)
+        ), patch.object(installer.sys, "executable", str(executable)):
+            with contextlib.redirect_stdout(io.StringIO()):
+                installer.install()
+
+        settings = json.loads(safe_settings.read_text(encoding="utf-8"))
+        self.assertEqual(
+            settings["statusLine"]["command"],
+            f"{os.path.realpath(executable)} -S {os.path.abspath(safe_config / 'statusline.py')}",
+        )
+        self.assertEqual(legacy_launcher.read_bytes(), b"@echo legacy\r\n")
+
+    def test_atomic_write_retries_transient_lock_and_cleans_up_on_failure(self):
+        target = self.config / "atomic-target.txt"
+        target.write_bytes(b"old")
+
+        real_replace = os.replace
+        attempts = {"count": 0}
+
+        def flaky_replace(src, dst):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise PermissionError("transient lock")
+            return real_replace(src, dst)
+
+        with patch.object(installer.os, "replace", side_effect=flaky_replace), patch.object(
+            installer.time, "sleep"
+        ):
+            installer._atomic_write_bytes(str(target), b"new")
+        self.assertEqual(attempts["count"], 2)
+        self.assertEqual(target.read_bytes(), b"new")
+        self.assertEqual(list(self.config.glob("*.tmp")), [])
+
+        with patch.object(
+            installer.os, "replace", side_effect=PermissionError("persistent lock")
+        ), patch.object(installer.time, "sleep"):
+            with self.assertRaises(PermissionError):
+                installer._atomic_write_bytes(str(target), b"newer")
+        self.assertEqual(target.read_bytes(), b"new")
+        self.assertEqual(list(self.config.glob("*.tmp")), [])
+
 
 if __name__ == "__main__":
     unittest.main()

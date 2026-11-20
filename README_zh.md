@@ -44,9 +44,9 @@
    ```
 
 安装脚本将自动执行：
-- 将 `statusline.py` 复制到 `~/.gemini/antigravity-cli/statusline.py`
+- 将 `statusline.py` 原子写入到 `~/.gemini/antigravity-cli/statusline.py`
 - 固定安装时使用的 Python 解释器绝对路径，并加上 `-S` 跳过 site 初始化
-- 在 Windows 上创建 `statusline.cmd`，正确处理 CLI 的命令转义
+- 在 Windows 上，当解释器和脚本路径均不含空格及 `cmd.exe` 特殊字符时直接调用 `python.exe -S statusline.py`（避免 `.cmd` 批处理层反复开关文件引发的文件锁冲突）；仅在路径需要引号转义时自动回退到精简的 `statusline.cmd` 启动脚本
 - 验证实际安装的启动命令后，再备份并保存配置
 - 更新 `"statusLine"` 命令钩子，保留其他设置
 
@@ -70,7 +70,7 @@
    }
    ```
 
-   请替换示例中的绝对路径；路径包含空格或特殊字符时，需要分别进行 shell 转义。Windows 请使用自动安装脚本：安装器会生成批处理启动脚本和正确转义的命令，避免在 CLI 配置中直接嵌入带引号的 Python 参数。
+   请替换示例中的绝对路径；路径包含空格或特殊字符时，需要分别进行 shell 转义。Windows 下如果解释器和脚本路径均不含空格及 `cmd.exe` 特殊字符，也可以直接配置无引号的 `C:\...\python.exe -S C:\...\statusline.py`；否则请使用自动安装脚本生成 `.cmd` 启动脚本，避免在 CLI 配置中直接嵌入带引号的 Python 参数。
 
 ---
 
