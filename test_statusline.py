@@ -430,6 +430,621 @@ class QuotaSelectionTests(unittest.TestCase):
         self.assertIn(f"📅 Wk: {statusline.YELLOW}15%{statusline.RESET}", line2)
 
 
+class SharedQuotaSyncTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="agy-quota-sync-test-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.db_path = self.root / "statusline_quota.db"
+
+    @staticmethod
+    def _iso(epoch):
+        from datetime import datetime, timezone
+
+        return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _payload(
+        self,
+        email="user@example.com",
+        model_name="Gemini 4 Neon (XHigh)",
+        g5=0.95,
+        g5_reset=None,
+        gw=0.98,
+        gw_reset=None,
+        p5=1.0,
+        p5_reset=None,
+        pw=1.0,
+        pw_reset=None,
+        now=1_800_000_000,
+    ):
+        g5_reset = (now + 10_000) if g5_reset is None else g5_reset
+        gw_reset = (now + 400_000) if gw_reset is None else gw_reset
+        p5_reset = (now + 18_000) if p5_reset is None else p5_reset
+        pw_reset = (now + 604_800) if pw_reset is None else pw_reset
+        payload = {
+            "model": {"id": model_name, "display_name": model_name},
+            "quota": {
+                "3p-5h": {
+                    "remaining_fraction": p5,
+                    "reset_time": self._iso(p5_reset),
+                    "reset_in_seconds": max(0, int(p5_reset - now)),
+                },
+                "3p-weekly": {
+                    "remaining_fraction": pw,
+                    "reset_time": self._iso(pw_reset),
+                    "reset_in_seconds": max(0, int(pw_reset - now)),
+                },
+                "gemini-5h": {
+                    "remaining_fraction": g5,
+                    "reset_time": self._iso(g5_reset),
+                    "reset_in_seconds": max(0, int(g5_reset - now)),
+                },
+                "gemini-weekly": {
+                    "remaining_fraction": gw,
+                    "reset_time": self._iso(gw_reset),
+                    "reset_in_seconds": max(0, int(gw_reset - now)),
+                },
+            },
+        }
+        if email is not None:
+            payload["email"] = email
+        return payload
+
+    @staticmethod
+    def _frozen_tick(base_payload, now):
+        """Simulate agy ticking reset_in_seconds locally without calling doRefreshQuota."""
+        ticked = json.loads(json.dumps(base_payload))
+        for bucket in ticked.get("quota", {}).values():
+            if isinstance(bucket, dict) and bucket.get("reset_time"):
+                reset_epoch = statusline._parse_iso_timestamp(bucket["reset_time"])
+                if reset_epoch is not None:
+                    bucket["reset_in_seconds"] = max(0, int(reset_epoch - now))
+        return ticked
+
+    def test_parse_iso_timestamp_handles_rfc3339_variants(self):
+        expected = statusline._parse_iso_timestamp("2026-11-20T14:35:33Z")
+        self.assertIsNotNone(expected)
+        self.assertAlmostEqual(
+            statusline._parse_iso_timestamp("2026-11-20t14:35:33z"), expected, places=6
+        )
+        self.assertAlmostEqual(
+            statusline._parse_iso_timestamp("2026-11-20T22:35:33+08:00"), expected, places=6
+        )
+        self.assertAlmostEqual(
+            statusline._parse_iso_timestamp("2026-11-20T14:35:33.5Z"), expected + 0.5, places=6
+        )
+        self.assertAlmostEqual(
+            statusline._parse_iso_timestamp("2026-11-20T14:35:33.123456789Z"),
+            expected + 0.123456,
+            places=6,
+        )
+        for bad in (None, "", "   ", 123, "not-a-timestamp"):
+            with self.subTest(bad=bad):
+                self.assertIsNone(statusline._parse_iso_timestamp(bad))
+
+    def test_terminal_identity_skips_shells_and_guards_roots_and_cycles(self):
+        # Windows: python -> cmd.exe -> agy.exe
+        win_tree = {
+            200: (100, r"C:\Windows\System32\cmd.exe", "2000", 1005.0),
+            100: (50, r"C:\Users\h\.gemini\bin\agy.exe", "1000", 900.0),
+        }
+        tid, start_ts = statusline._get_terminal_identity(
+            _inspector=win_tree.get, _start_pid=200, _platform_tag="win"
+        )
+        self.assertEqual(tid, "win:100:1000")
+        self.assertEqual(start_ts, 900.0)
+
+        # Nested cmd.exe (.cmd launcher): python -> cmd -> cmd -> agy.exe
+        nested_tree = {
+            300: (200, "cmd.exe", "3000", 1006.0),
+            200: (100, "cmd.exe", "2000", 1005.0),
+            100: (50, "agy.exe", "1000", 900.0),
+        }
+        tid, start_ts = statusline._get_terminal_identity(
+            _inspector=nested_tree.get, _start_pid=300, _platform_tag="win"
+        )
+        self.assertEqual(tid, "win:100:1000")
+        self.assertEqual(start_ts, 900.0)
+
+        # Unix: /bin/sh exec optimization -> direct agy parent
+        unix_direct = {100: (50, "agy", "5555", 800.0)}
+        tid, start_ts = statusline._get_terminal_identity(
+            _inspector=unix_direct.get, _start_pid=100, _platform_tag="linux"
+        )
+        self.assertEqual(tid, "linux:100:5555")
+        self.assertEqual(start_ts, 800.0)
+
+        # Unreadable parent above cmd.exe must NOT misidentify transient cmd.exe
+        wrapper_only = {200: (100, "cmd.exe", "2000", 1005.0)}
+        self.assertEqual(
+            statusline._get_terminal_identity(
+                _inspector=wrapper_only.get, _start_pid=200, _platform_tag="win"
+            ),
+            (None, None),
+        )
+
+        # Orphan under init/systemd and cyclic parent chains fail safely
+        orphan_tree = {200: (1, "sh", "2000", 1005.0), 1: (0, "systemd", "1", 0.0)}
+        self.assertEqual(
+            statusline._get_terminal_identity(
+                _inspector=orphan_tree.get, _start_pid=200, _platform_tag="linux"
+            ),
+            (None, None),
+        )
+        cyclic_tree = {
+            200: (300, "sh", "2000", 1005.0),
+            300: (200, "bash", "3000", 1004.0),
+        }
+        self.assertEqual(
+            statusline._get_terminal_identity(
+                _inspector=cyclic_tree.get, _start_pid=200, _platform_tag="linux"
+            ),
+            (None, None),
+        )
+
+        # Linux /proc/<pid>/stat parsing with spaces and parentheses in comm
+        fields_after_state = ["0"] * 19
+        fields_after_state[0] = "1234"  # ppid (field 4)
+        fields_after_state[18] = "987654"  # starttime (field 22)
+        stat_line = f"5678 (agy (dev)) S {' '.join(fields_after_state)}\n"
+        self.assertEqual(statusline._parse_linux_proc_stat(stat_line), (1234, "agy (dev)", 987654))
+
+    def test_confirmed_refresh_syncs_and_handles_non_monotonic_jitter(self):
+        t0 = 1_800_000_000.0
+        g5_reset = t0 + 10_000
+        gw_reset = t0 + 400_000
+        term_a = ("win:101:1", t0 - 2.0)  # Fresh start -> CONFIRMED
+        term_b = ("win:202:1", t0 - 1.0)
+
+        # Terminal A starts with 97%
+        p_a = self._payload(g5=0.97, g5_reset=g5_reset, gw=0.98, gw_reset=gw_reset, now=t0)
+        p_a_orig = json.dumps(p_a, sort_keys=True)
+        out_a = statusline.sync_shared_quota(
+            p_a, db_path=self.db_path, _now=t0, _terminal_identity=term_a
+        )
+        self.assertEqual(json.dumps(p_a, sort_keys=True), p_a_orig)  # Input not mutated
+        self.assertAlmostEqual(out_a["quota"]["gemini-5h"]["remaining_fraction"], 0.97)
+
+        # Terminal A ticking with identical fingerprint performs zero write transactions
+        real_connect = sqlite3.connect
+        tx_starts = []
+
+        class CountingConnection(sqlite3.Connection):
+            def execute(self, sql, *args, **kwargs):
+                if isinstance(sql, str) and sql.strip().upper().startswith("BEGIN"):
+                    tx_starts.append(sql)
+                return super().execute(sql, *args, **kwargs)
+
+        with patch.object(
+            statusline.sqlite3,
+            "connect",
+            lambda *a, **kw: real_connect(*a, factory=CountingConnection, **kw),
+        ):
+            p_a_tick = self._payload(
+                g5=0.97, g5_reset=g5_reset, gw=0.98, gw_reset=gw_reset, now=t0 + 15, p5_reset=t0 + 18_000, pw_reset=t0 + 604_800
+            )
+            statusline.sync_shared_quota(
+                p_a_tick, db_path=self.db_path, _now=t0 + 15, _terminal_identity=term_a
+            )
+        self.assertEqual(tx_starts, [])
+
+        # Terminal B registers at 97%, then refreshes at t0+60 to 90.95%
+        statusline.sync_shared_quota(
+            self._payload(g5=0.97, g5_reset=g5_reset, gw=0.98, gw_reset=gw_reset, now=t0 + 5),
+            db_path=self.db_path,
+            _now=t0 + 5,
+            _terminal_identity=term_b,
+        )
+        statusline.sync_shared_quota(
+            self._payload(
+                g5=0.9095374, g5_reset=g5_reset, gw=0.9682614, gw_reset=gw_reset, now=t0 + 60
+            ),
+            db_path=self.db_path,
+            _now=t0 + 60,
+            _terminal_identity=term_b,
+        )
+
+        # Busy Terminal A still sends frozen 97%, immediately receives 90.95% + live countdown
+        synced_a = statusline.sync_shared_quota(
+            self._payload(
+                g5=0.97, g5_reset=g5_reset, gw=0.98, gw_reset=gw_reset, now=t0 + 75, p5_reset=t0 + 18_000, pw_reset=t0 + 604_800
+            ),
+            db_path=self.db_path,
+            _now=t0 + 75,
+            _terminal_identity=term_a,
+        )
+        self.assertAlmostEqual(synced_a["quota"]["gemini-5h"]["remaining_fraction"], 0.9095374)
+        self.assertEqual(synced_a["quota"]["gemini-5h"]["reset_in_seconds"], int(g5_reset - (t0 + 75)))
+
+        # Non-monotonic jitter: Terminal B refreshes upward to 91.51% -> newest CONFIRMED wins
+        statusline.sync_shared_quota(
+            self._payload(
+                g5=0.9151157, g5_reset=g5_reset, gw=0.961269, gw_reset=gw_reset, now=t0 + 120
+            ),
+            db_path=self.db_path,
+            _now=t0 + 120,
+            _terminal_identity=term_b,
+        )
+        synced_a2 = statusline.sync_shared_quota(
+            self._payload(
+                g5=0.97, g5_reset=g5_reset, gw=0.98, gw_reset=gw_reset, now=t0 + 125, p5_reset=t0 + 18_000, pw_reset=t0 + 604_800
+            ),
+            db_path=self.db_path,
+            _now=t0 + 125,
+            _terminal_identity=term_a,
+        )
+        self.assertAlmostEqual(synced_a2["quota"]["gemini-5h"]["remaining_fraction"], 0.9151157)
+        self.assertAlmostEqual(synced_a2["quota"]["gemini-weekly"]["remaining_fraction"], 0.961269)
+
+        # Brand-new Terminal C starts at t0+200 -> CONFIRMED immediately updates all terminals
+        term_c = ("win:303:1", t0 + 198.0)
+        statusline.sync_shared_quota(
+            self._payload(
+                g5=0.90321046, g5_reset=g5_reset, gw=0.9666797, gw_reset=gw_reset, now=t0 + 200
+            ),
+            db_path=self.db_path,
+            _now=t0 + 200,
+            _terminal_identity=term_c,
+        )
+        synced_a3 = statusline.sync_shared_quota(
+            self._payload(
+                g5=0.97, g5_reset=g5_reset, gw=0.98, gw_reset=gw_reset, now=t0 + 205, p5_reset=t0 + 18_000, pw_reset=t0 + 604_800
+            ),
+            db_path=self.db_path,
+            _now=t0 + 205,
+            _terminal_identity=term_a,
+        )
+        self.assertAlmostEqual(synced_a3["quota"]["gemini-5h"]["remaining_fraction"], 0.90321046)
+
+        with contextlib.closing(sqlite3.connect(self.db_path)) as con:
+            self.assertEqual(con.execute("PRAGMA journal_mode").fetchone()[0].lower(), "wal")
+
+    def test_cold_start_disambiguation_and_delayed_login_promotion(self):
+        t_now = 1_800_010_000.0
+        g5_reset = t_now + 8_000
+        gw_reset = t_now + 400_000
+
+        # Both orderings with a 100% sliding 3p bucket: newer sliding clock wins even with upward jitter
+        for order_name, sequence in (
+            ("stale_then_fresh", ("stale", "fresh")),
+            ("fresh_then_stale", ("fresh", "stale")),
+        ):
+            with self.subTest(order=order_name):
+                db = self.root / f"cold_sliding_{order_name}.db"
+                old_a = ("win:11:1", t_now - 7200.0)
+                old_b = ("win:22:1", t_now - 3600.0)
+                stale_payload = self._payload(
+                    g5=0.9095,
+                    g5_reset=g5_reset,
+                    gw=0.968,
+                    gw_reset=gw_reset,
+                    p5=1.0,
+                    p5_reset=(t_now - 1800) + 18_000,  # fetched 30m ago
+                    pw=1.0,
+                    pw_reset=(t_now - 1800) + 604_800,
+                    now=t_now,
+                )
+                fresh_payload = self._payload(
+                    g5=0.9151,  # higher due to jitter, but fetched 1m ago!
+                    g5_reset=g5_reset,
+                    gw=0.961,
+                    gw_reset=gw_reset,
+                    p5=1.0,
+                    p5_reset=(t_now - 60) + 18_000,  # fetched 1m ago
+                    pw=1.0,
+                    pw_reset=(t_now - 60) + 604_800,
+                    now=t_now,
+                )
+                for tag in sequence:
+                    if tag == "stale":
+                        statusline.sync_shared_quota(
+                            stale_payload, db_path=db, _now=t_now, _terminal_identity=old_a
+                        )
+                    else:
+                        statusline.sync_shared_quota(
+                            fresh_payload, db_path=db, _now=t_now, _terminal_identity=old_b
+                        )
+                out = statusline.sync_shared_quota(
+                    stale_payload, db_path=db, _now=t_now + 1, _terminal_identity=old_a
+                )
+                self.assertAlmostEqual(out["quota"]["gemini-5h"]["remaining_fraction"], 0.9151)
+
+        # When all buckets are <100% (no sliding clock), same-window lower remaining wins both orders
+        for order_name, sequence in (
+            ("high_then_low", ("high", "low")),
+            ("low_then_high", ("low", "high")),
+        ):
+            with self.subTest(all_used_order=order_name):
+                db = self.root / f"cold_used_{order_name}.db"
+                old_a = ("win:33:1", t_now - 7200.0)
+                old_b = ("win:44:1", t_now - 3600.0)
+                high_p = self._payload(
+                    g5=0.97, g5_reset=g5_reset, gw=0.98, gw_reset=gw_reset,
+                    p5=0.80, p5_reset=g5_reset, pw=0.90, pw_reset=gw_reset, now=t_now,
+                )
+                low_p = self._payload(
+                    g5=0.82, g5_reset=g5_reset, gw=0.94, gw_reset=gw_reset,
+                    p5=0.75, p5_reset=g5_reset, pw=0.89, pw_reset=gw_reset, now=t_now,
+                )
+                for tag in sequence:
+                    statusline.sync_shared_quota(
+                        high_p if tag == "high" else low_p,
+                        db_path=db,
+                        _now=t_now,
+                        _terminal_identity=old_a if tag == "high" else old_b,
+                    )
+                out = statusline.sync_shared_quota(
+                    high_p, db_path=db, _now=t_now + 1, _terminal_identity=old_a
+                )
+                self.assertAlmostEqual(out["quota"]["gemini-5h"]["remaining_fraction"], 0.82)
+
+        # Cold-start old terminal must never overwrite a CONFIRMED cache entry, while
+        # delayed login (pre-quota registration followed by first quota >30s later) IS CONFIRMED.
+        db_delay = self.root / "delayed_login.db"
+        fresh_term = ("win:55:1", t_now - 3.0)
+        statusline.sync_shared_quota(
+            self._payload(g5=0.85, g5_reset=g5_reset, now=t_now),
+            db_path=db_delay,
+            _now=t_now,
+            _terminal_identity=fresh_term,
+        )
+        old_term = ("win:66:1", t_now - 5000.0)
+        old_payload = self._payload(g5=0.97, g5_reset=g5_reset, now=t_now + 2)
+        out_old = statusline.sync_shared_quota(
+            old_payload,
+            db_path=db_delay,
+            _now=t_now + 2,
+            _terminal_identity=old_term,
+        )
+        self.assertAlmostEqual(out_old["quota"]["gemini-5h"]["remaining_fraction"], 0.85)
+
+        delayed_term = ("win:77:1", t_now - 100.0)
+        pre_quota = {"email": "user@example.com", "agent_state": "idle"}
+        self.assertEqual(
+            statusline.sync_shared_quota(
+                pre_quota, db_path=db_delay, _now=t_now + 5, _terminal_identity=delayed_term
+            ),
+            pre_quota,
+        )
+        # First quota arrives later -> transition from "" -> fp is CONFIRMED
+        statusline.sync_shared_quota(
+            self._payload(g5=0.88, g5_reset=g5_reset, now=t_now + 20),
+            db_path=db_delay,
+            _now=t_now + 20,
+            _terminal_identity=delayed_term,
+        )
+        out_after_delay = statusline.sync_shared_quota(
+            self._frozen_tick(old_payload, t_now + 25),
+            db_path=db_delay,
+            _now=t_now + 25,
+            _terminal_identity=old_term,
+        )
+        self.assertAlmostEqual(out_after_delay["quota"]["gemini-5h"]["remaining_fraction"], 0.88)
+
+    def test_window_rollover_cross_model_and_account_isolation(self):
+        t0 = 1_800_020_000.0
+        old_reset = t0 + 600  # expires at t0+600
+        new_reset = t0 + 600 + 18_000
+        gw_reset = t0 + 400_000
+
+        # Account A: Claude terminal refreshes -> Gemini terminal sees updated gemini-5h
+        claude_term = ("win:10:1", t0 - 2.0)
+        gemini_term = ("win:20:1", t0 - 5000.0)
+        statusline.sync_shared_quota(
+            self._payload(
+                email="Alice@Example.com",
+                model_name="Claude Opus 5.5 (High)",
+                g5=0.64,
+                g5_reset=old_reset,
+                gw=0.91,
+                gw_reset=gw_reset,
+                p5=0.88,
+                p5_reset=old_reset,
+                now=t0,
+            ),
+            db_path=self.db_path,
+            _now=t0,
+            _terminal_identity=claude_term,
+        )
+
+        # Account B: completely isolated
+        bob_term = ("win:30:1", t0 - 1.0)
+        statusline.sync_shared_quota(
+            self._payload(
+                email="bob@example.com",
+                model_name="Gemini 4 Neon (XHigh)",
+                g5=0.99,
+                g5_reset=old_reset,
+                gw=0.99,
+                gw_reset=gw_reset,
+                now=t0 + 1,
+            ),
+            db_path=self.db_path,
+            _now=t0 + 1,
+            _terminal_identity=bob_term,
+        )
+
+        # Alice's Gemini terminal (lowercase email) gets 64% from Alice's Claude terminal, not Bob's 99%
+        alice_gemini = statusline.sync_shared_quota(
+            self._payload(
+                email="alice@example.com",
+                model_name="Gemini 4 Neon (XHigh)",
+                g5=0.95,
+                g5_reset=old_reset,
+                gw=0.98,
+                gw_reset=gw_reset,
+                now=t0 + 10,
+            ),
+            db_path=self.db_path,
+            _now=t0 + 10,
+            _terminal_identity=gemini_term,
+        )
+        _, line2 = statusline.render_statusline(alice_gemini).splitlines()
+        self.assertIn(f"⏳ 5h: {statusline.GREEN}64%{statusline.RESET}", line2)
+        self.assertIn(f"📅 Wk: {statusline.GREEN}91%{statusline.RESET}", line2)
+
+        # Window rollover: after old_reset expires, a new window (100%) supersedes expired 64%
+        rollover_now = old_reset + 120
+        statusline.sync_shared_quota(
+            self._payload(
+                email="alice@example.com",
+                g5=1.0,
+                g5_reset=new_reset,
+                gw=0.91,
+                gw_reset=gw_reset,
+                now=rollover_now,
+            ),
+            db_path=self.db_path,
+            _now=rollover_now,
+            _terminal_identity=("win:40:1", rollover_now - 3600.0),  # even cold-start beats expired window
+        )
+        alice_after_rollover = statusline.sync_shared_quota(
+            self._payload(
+                email="alice@example.com",
+                g5=0.95,
+                g5_reset=old_reset,
+                gw=0.98,
+                gw_reset=gw_reset,
+                now=rollover_now + 5,
+            ),
+            db_path=self.db_path,
+            _now=rollover_now + 5,
+            _terminal_identity=gemini_term,
+        )
+        self.assertAlmostEqual(alice_after_rollover["quota"]["gemini-5h"]["remaining_fraction"], 1.0)
+        self.assertEqual(
+            alice_after_rollover["quota"]["gemini-5h"]["reset_in_seconds"],
+            int(new_reset - (rollover_now + 5)),
+        )
+
+        # Missing email or opt-out env var skips shared sync cleanly
+        no_email = self._payload(email=None, g5=0.50, g5_reset=new_reset, now=rollover_now)
+        self.assertIs(
+            statusline.sync_shared_quota(
+                no_email, db_path=self.db_path, _now=rollover_now, _terminal_identity=gemini_term
+            ),
+            no_email,
+        )
+        with patch.dict(os.environ, {"AGY_STATUSLINE_SHARED_QUOTA": "0"}):
+            self.assertEqual(statusline._resolve_quota_cache_db_path(), "")
+
+    def test_resilience_write_lock_corrupt_db_pruning_and_concurrency(self):
+        import threading
+
+        t0 = 1_800_030_000.0
+        g5_reset = t0 + 10_000
+        term_a = ("win:501:1", t0 - 2.0)
+        term_b = ("win:502:1", t0 - 2.0)
+
+        # Seed cache with 90% from Terminal A
+        term_a_payload = self._payload(g5=0.90, g5_reset=g5_reset, now=t0)
+        statusline.sync_shared_quota(
+            term_a_payload,
+            db_path=self.db_path,
+            _now=t0,
+            _terminal_identity=term_a,
+        )
+        # Seed Terminal B with 90%
+        statusline.sync_shared_quota(
+            self._payload(g5=0.90, g5_reset=g5_reset, now=t0 + 1),
+            db_path=self.db_path,
+            _now=t0 + 1,
+            _terminal_identity=term_b,
+        )
+
+        # Simulate transient write lock when Terminal B refreshes to 72%:
+        # must keep Terminal B's fresh 72% instead of reverting to stale cached 90%.
+        with patch.object(
+            statusline, "_commit_quota_update", side_effect=sqlite3.OperationalError("database is locked")
+        ):
+            locked_refresh = statusline.sync_shared_quota(
+                self._payload(g5=0.72, g5_reset=g5_reset, now=t0 + 30),
+                db_path=self.db_path,
+                _now=t0 + 30,
+                _terminal_identity=term_b,
+            )
+        self.assertAlmostEqual(locked_refresh["quota"]["gemini-5h"]["remaining_fraction"], 0.72)
+
+        # Update cache to 72% normally, then fail heartbeat write for unchanged Terminal A (>30m later):
+        # unchanged Terminal A must STILL display fresher cached 72%.
+        statusline.sync_shared_quota(
+            self._payload(g5=0.72, g5_reset=g5_reset, now=t0 + 31),
+            db_path=self.db_path,
+            _now=t0 + 31,
+            _terminal_identity=term_b,
+        )
+        with patch.object(
+            statusline, "_commit_quota_update", side_effect=sqlite3.OperationalError("database is locked")
+        ):
+            locked_heartbeat = statusline.sync_shared_quota(
+                self._frozen_tick(term_a_payload, t0 + 2000),
+                db_path=self.db_path,
+                _now=t0 + 2000,
+                _terminal_identity=term_a,
+            )
+        self.assertAlmostEqual(locked_heartbeat["quota"]["gemini-5h"]["remaining_fraction"], 0.72)
+
+        # Corrupt .db file auto-recovers safely; non-.db file is NEVER unlinked
+        corrupt_db = self.root / "corrupt.db"
+        corrupt_db.write_bytes(b"not a valid sqlite database payload!!!")
+        p = self._payload(g5=0.80, g5_reset=g5_reset, now=t0)
+        fallback = statusline.sync_shared_quota(
+            p, db_path=corrupt_db, _now=t0, _terminal_identity=term_a
+        )
+        self.assertAlmostEqual(fallback["quota"]["gemini-5h"]["remaining_fraction"], 0.80)
+        self.assertFalse(corrupt_db.exists())
+        # Next call recreates clean DB
+        statusline.sync_shared_quota(
+            p, db_path=corrupt_db, _now=t0 + 1, _terminal_identity=term_a
+        )
+        self.assertTrue(corrupt_db.exists())
+
+        precious_json = self.root / "settings.json"
+        precious_json.write_text('{"theme":"dark"}', encoding="utf-8")
+        statusline.sync_shared_quota(
+            p, db_path=precious_json, _now=t0, _terminal_identity=term_a
+        )
+        self.assertTrue(precious_json.exists())
+
+        # Concurrent multi-thread writers + readers on WAL DB complete cleanly without errors
+        concurrent_db = self.root / "concurrent.db"
+        errors = []
+
+        def worker(idx):
+            try:
+                tid = (f"win:{1000 + idx}:1", t0 - 1.0)
+                for step in range(5):
+                    ts = t0 + step * 10 + idx * 0.1
+                    frac = max(0.1, 0.95 - step * 0.05 - idx * 0.001)
+                    statusline.sync_shared_quota(
+                        self._payload(g5=frac, g5_reset=g5_reset, now=ts),
+                        db_path=concurrent_db,
+                        _now=ts,
+                        _terminal_identity=tid,
+                    )
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(timeout=10)
+        self.assertEqual(errors, [])
+
+        # Pruning removes >24h old terminal rows on the next write
+        later = t0 + 90_000.0
+        statusline.sync_shared_quota(
+            self._payload(g5=0.99, g5_reset=later + 18_000, now=later),
+            db_path=concurrent_db,
+            _now=later,
+            _terminal_identity=("win:9999:1", later - 1.0),
+        )
+        with contextlib.closing(sqlite3.connect(concurrent_db)) as con:
+            remaining_terms = con.execute("SELECT terminal_id FROM terminal_state").fetchall()
+        self.assertEqual(remaining_terms, [("win:9999:1",)])
+
+
 class StatuslineInputTests(unittest.TestCase):
     command = [sys.executable, "-S", statusline.__file__]
 

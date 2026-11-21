@@ -10,6 +10,7 @@ import sqlite3
 import threading
 import time
 from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Ensure UTF-8 output across Windows, macOS, and Linux
@@ -808,6 +809,1033 @@ def select_model_quotas(quotas, model_name="", response_model=""):
     return None, None
 
 
+# Cross-terminal shared quota synchronization constants
+_QUOTA_CONFIDENCE_COLD = 1
+_QUOTA_CONFIDENCE_CONFIRMED = 2
+_FRESH_PROCESS_WINDOW_SECONDS = 30.0
+_WINDOW_ROLLOVER_GRACE_SECONDS = 60.0
+_CACHE_MAX_STALE_SECONDS = 6 * 3600.0
+_TERMINAL_TOUCH_INTERVAL_SECONDS = 1800.0
+_TERMINAL_PRUNE_AGE_SECONDS = 24 * 3600.0
+_MAX_ANCESTOR_HOPS = 6
+_QUOTA_WINDOW_DURATIONS = {
+    "five_hour": 5 * 3600.0,
+    "weekly": 7 * 86400.0,
+}
+
+_WRAPPER_PROCESS_NAMES = frozenset({
+    "cmd",
+    "sh",
+    "bash",
+    "zsh",
+    "dash",
+    "ash",
+    "ksh",
+    "fish",
+    "csh",
+    "tcsh",
+    "pwsh",
+    "powershell",
+    "python",
+    "python3",
+    "py",
+    "env",
+    "timeout",
+})
+_NON_TERMINAL_ROOT_NAMES = frozenset({
+    "init",
+    "systemd",
+    "launchd",
+    "system",
+    "services",
+    "wininit",
+})
+
+_WIN32_PROC_API = None
+_LINUX_BOOT_TIME = None
+_DARWIN_PROC_API = None
+
+
+def _parse_iso_timestamp(value):
+    """Parse an RFC 3339 / ISO-8601 timestamp string into Unix epoch seconds, or None."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text[-1] in ("Z", "z"):
+        text = text[:-1] + "+00:00"
+
+    sep_idx = text.find("T")
+    if sep_idx < 0:
+        sep_idx = text.find("t")
+        if sep_idx > 0:
+            text = text[:sep_idx] + "T" + text[sep_idx + 1 :]
+    if sep_idx < 0:
+        sep_idx = text.find(" ")
+
+    # Normalize fractional seconds to 6 digits for Python 3.8-3.10 fromisoformat support.
+    if sep_idx > 0:
+        time_part = text[sep_idx + 1 :]
+        dot_idx = time_part.find(".")
+        if dot_idx >= 0:
+            frac_start = sep_idx + 1 + dot_idx + 1
+            frac_end = frac_start
+            while frac_end < len(text) and text[frac_end].isdigit():
+                frac_end += 1
+            if frac_end > frac_start:
+                frac = text[frac_start:frac_end]
+                if len(frac) != 6:
+                    frac = (frac + "000000")[:6]
+                    text = text[:frac_start] + frac + text[frac_end:]
+
+    try:
+        dt = datetime.fromisoformat(text)
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    ts = dt.timestamp()
+    return float(ts) if math.isfinite(ts) else None
+
+
+def _normalize_process_name(raw_name):
+    """Normalize an executable path or comm name to a lowercase stem without .exe."""
+    if not raw_name:
+        return ""
+    base = os.path.basename(str(raw_name).replace("\\", "/")).strip().lower()
+    if base.endswith(".exe"):
+        base = base[:-4]
+    return base
+
+
+def _is_host_agy_name(norm_name):
+    """Return True if norm_name identifies a host Antigravity CLI process."""
+    return bool(
+        norm_name == "agy"
+        or norm_name.startswith("agy-")
+        or norm_name.startswith("antigravity")
+    )
+
+
+def _is_wrapper_process_name(norm_name):
+    """Return True if norm_name is a transient shell or Python launcher wrapper."""
+    if not norm_name or norm_name in _WRAPPER_PROCESS_NAMES:
+        return True
+    if norm_name.startswith("python"):
+        suffix = norm_name[6:]
+        if suffix.startswith("w"):
+            suffix = suffix[1:]
+        if not suffix or suffix.replace(".", "").isdigit():
+            return True
+    return False
+
+
+def _get_win32_proc_api():
+    """Lazily initialize typed ctypes bindings for Windows process inspection."""
+    global _WIN32_PROC_API
+    if _WIN32_PROC_API is not None:
+        return _WIN32_PROC_API
+
+    import ctypes
+    from ctypes import wintypes
+
+    class PROCESS_BASIC_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("ExitStatus", ctypes.c_void_p),
+            ("PebBaseAddress", ctypes.c_void_p),
+            ("AffinityMask", ctypes.c_void_p),
+            ("BasePriority", ctypes.c_void_p),
+            ("UniqueProcessId", ctypes.c_void_p),
+            ("InheritedFromUniqueProcessId", ctypes.c_void_p),
+        ]
+
+    class FILETIME(ctypes.Structure):
+        _fields_ = [
+            ("dwLowDateTime", wintypes.DWORD),
+            ("dwHighDateTime", wintypes.DWORD),
+        ]
+
+    ntdll = ctypes.WinDLL("ntdll")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.GetProcessTimes.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(FILETIME),
+        ctypes.POINTER(FILETIME),
+        ctypes.POINTER(FILETIME),
+        ctypes.POINTER(FILETIME),
+    ]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    ntdll.NtQueryInformationProcess.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.ULONG,
+        ctypes.POINTER(wintypes.ULONG),
+    ]
+    ntdll.NtQueryInformationProcess.restype = ctypes.c_long
+
+    _WIN32_PROC_API = (
+        ctypes,
+        wintypes,
+        ntdll,
+        kernel32,
+        PROCESS_BASIC_INFORMATION,
+        FILETIME,
+    )
+    return _WIN32_PROC_API
+
+
+def _inspect_process_windows(pid):
+    """Return (ppid, image_name, start_token, start_ts) for a Windows PID, or None."""
+    if pid <= 4:
+        return None
+    try:
+        (
+            ctypes,
+            wintypes,
+            ntdll,
+            kernel32,
+            pbi_cls,
+            ft_cls,
+        ) = _get_win32_proc_api()
+    except Exception:
+        return None
+
+    handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return None
+    try:
+        pbi = pbi_cls()
+        ret_len = wintypes.ULONG(0)
+        status = ntdll.NtQueryInformationProcess(
+            handle, 0, ctypes.byref(pbi), ctypes.sizeof(pbi), ctypes.byref(ret_len)
+        )
+        ppid = int(pbi.InheritedFromUniqueProcessId or 0) if status == 0 else 0
+
+        ct, et, kt, ut = ft_cls(), ft_cls(), ft_cls(), ft_cls()
+        token = ""
+        start_ts = None
+        if kernel32.GetProcessTimes(
+            handle, ctypes.byref(ct), ctypes.byref(et), ctypes.byref(kt), ctypes.byref(ut)
+        ):
+            raw_ticks = (ct.dwHighDateTime << 32) | ct.dwLowDateTime
+            if raw_ticks > 116444736000000000:
+                token = str(raw_ticks)
+                start_ts = (raw_ticks - 116444736000000000) / 10_000_000.0
+
+        buf = ctypes.create_unicode_buffer(1024)
+        size = wintypes.DWORD(len(buf))
+        name = ""
+        if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            name = buf.value
+
+        return ppid, name, token, start_ts
+    except Exception:
+        return None
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _parse_linux_proc_stat(stat_text):
+    """Parse /proc/<pid>/stat text into (ppid, comm, starttime_ticks), or None."""
+    if not stat_text or not isinstance(stat_text, str):
+        return None
+    lparen = stat_text.find("(")
+    rparen = stat_text.rfind(")")
+    if lparen < 0 or rparen <= lparen:
+        return None
+    comm = stat_text[lparen + 1 : rparen]
+    rest = stat_text[rparen + 2 :].split()
+    if len(rest) <= 19:
+        return None
+    try:
+        ppid = int(rest[1])
+        starttime = int(rest[19])
+    except ValueError:
+        return None
+    if starttime < 0:
+        return None
+    return ppid, comm, starttime
+
+
+def _get_linux_boot_time():
+    """Read Linux system boot Unix timestamp from /proc/stat once per process."""
+    global _LINUX_BOOT_TIME
+    if _LINUX_BOOT_TIME is not None:
+        return _LINUX_BOOT_TIME
+    try:
+        with open("/proc/stat", "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if line.startswith("btime "):
+                    _LINUX_BOOT_TIME = float(line.split()[1])
+                    return _LINUX_BOOT_TIME
+    except Exception:
+        pass
+    return None
+
+
+def _inspect_process_linux(pid):
+    """Return (ppid, comm, start_token, start_ts) for a Linux PID, or None."""
+    if pid <= 1:
+        return None
+    try:
+        with open(f"/proc/{pid}/stat", "r", encoding="utf-8", errors="ignore") as f:
+            parsed = _parse_linux_proc_stat(f.read())
+    except OSError:
+        return None
+    if parsed is None:
+        return None
+    ppid, comm, starttime = parsed
+    start_ts = None
+    btime = _get_linux_boot_time()
+    if btime is not None:
+        try:
+            clk_tck = float(os.sysconf("SC_CLK_TCK"))
+            if clk_tck > 0:
+                start_ts = btime + (starttime / clk_tck)
+        except Exception:
+            pass
+    return ppid, comm, str(starttime), start_ts
+
+
+def _get_darwin_proc_api():
+    """Lazily initialize typed ctypes bindings for macOS proc_pidinfo."""
+    global _DARWIN_PROC_API
+    if _DARWIN_PROC_API is not None:
+        return _DARWIN_PROC_API
+
+    import ctypes
+
+    class ProcBsdInfo(ctypes.Structure):
+        _fields_ = [
+            ("pbi_flags", ctypes.c_uint32),
+            ("pbi_status", ctypes.c_uint32),
+            ("pbi_xstatus", ctypes.c_uint32),
+            ("pbi_pid", ctypes.c_uint32),
+            ("pbi_ppid", ctypes.c_uint32),
+            ("pbi_uid", ctypes.c_uint32),
+            ("pbi_gid", ctypes.c_uint32),
+            ("pbi_ruid", ctypes.c_uint32),
+            ("pbi_rgid", ctypes.c_uint32),
+            ("pbi_svuid", ctypes.c_uint32),
+            ("pbi_svgid", ctypes.c_uint32),
+            ("rfu_1", ctypes.c_uint32),
+            ("pbi_comm", ctypes.c_char * 16),
+            ("pbi_name", ctypes.c_char * 32),
+            ("pbi_nfiles", ctypes.c_uint32),
+            ("pbi_pgid", ctypes.c_uint32),
+            ("pbi_pjobc", ctypes.c_uint32),
+            ("e_tdev", ctypes.c_uint32),
+            ("e_tpgid", ctypes.c_uint32),
+            ("pbi_nice", ctypes.c_int32),
+            ("pbi_start_tvsec", ctypes.c_uint64),
+            ("pbi_start_tvusec", ctypes.c_uint64),
+        ]
+
+    libsystem = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+    libsystem.proc_pidinfo.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    libsystem.proc_pidinfo.restype = ctypes.c_int
+
+    _DARWIN_PROC_API = (ctypes, libsystem, ProcBsdInfo)
+    return _DARWIN_PROC_API
+
+
+def _inspect_process_darwin(pid):
+    """Return (ppid, proc_name, start_token, start_ts) for a macOS PID, or None."""
+    if pid <= 1:
+        return None
+    try:
+        ctypes, libsystem, bsd_cls = _get_darwin_proc_api()
+        info = bsd_cls()
+        size = ctypes.sizeof(info)
+        if size != 136:
+            return None
+        ret = libsystem.proc_pidinfo(pid, 3, 0, ctypes.byref(info), size)  # PROC_PIDTBSDINFO
+        if ret != size:
+            return None
+        raw_name = info.pbi_name if info.pbi_name and info.pbi_name[0] else info.pbi_comm
+        name = bytes(raw_name).split(b"\x00", 1)[0].decode("utf-8", errors="ignore")
+        token = f"{info.pbi_start_tvsec}.{info.pbi_start_tvusec:06d}"
+        start_ts = (
+            float(info.pbi_start_tvsec) + float(info.pbi_start_tvusec) / 1_000_000.0
+            if info.pbi_start_tvsec > 0
+            else None
+        )
+        return int(info.pbi_ppid), name, token, start_ts
+    except Exception:
+        return None
+
+
+def _get_terminal_identity(_inspector=None, _start_pid=None, _platform_tag=None):
+    """
+    Identify the host Antigravity CLI process by walking parent processes past
+    transient shell wrappers (cmd.exe / sh). Returns (terminal_id, proc_start_ts)
+    or (None, None) when no stable non-wrapper ancestor can be verified.
+    """
+    if _inspector is None:
+        if os.name == "nt":
+            _inspector = _inspect_process_windows
+            platform_tag = _platform_tag or "win"
+        elif sys.platform.startswith("linux"):
+            _inspector = _inspect_process_linux
+            platform_tag = _platform_tag or "linux"
+        elif sys.platform == "darwin":
+            _inspector = _inspect_process_darwin
+            platform_tag = _platform_tag or "macos"
+        else:
+            return None, None
+    else:
+        platform_tag = _platform_tag or "proc"
+
+    try:
+        pid = os.getppid() if _start_pid is None else int(_start_pid)
+    except Exception:
+        return None, None
+
+    visited = set()
+    ancestors = []
+    min_pid = 5 if platform_tag == "win" else 2
+
+    for _ in range(_MAX_ANCESTOR_HOPS):
+        if pid < min_pid or pid in visited:
+            break
+        visited.add(pid)
+        info = _inspector(pid)
+        if not info:
+            break
+        ppid, raw_name, token, start_ts = info
+        norm_name = _normalize_process_name(raw_name)
+        ancestors.append((pid, norm_name, token, start_ts))
+        if _is_host_agy_name(norm_name) and token:
+            return f"{platform_tag}:{pid}:{token}", start_ts
+        if not ppid or ppid == pid:
+            break
+        pid = int(ppid)
+
+    for anc_pid, norm_name, token, start_ts in ancestors:
+        if (
+            token
+            and not _is_wrapper_process_name(norm_name)
+            and norm_name not in _NON_TERMINAL_ROOT_NAMES
+        ):
+            return f"{platform_tag}:{anc_pid}:{token}", start_ts
+
+    return None, None
+
+
+def _coerce_finite_float(val):
+    """Return finite float(val) for non-bool numeric inputs, or None."""
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        num = float(val)
+    except Exception:
+        return None
+    return num if math.isfinite(num) else None
+
+
+def _quota_fingerprint(quotas):
+    """
+    Compute a canonical fingerprint of server-reported quota buckets, excluding
+    locally ticked countdown fields such as reset_in_seconds.
+    """
+    if not isinstance(quotas, dict):
+        return ""
+    items = []
+    for key in sorted(quotas):
+        val = quotas.get(key)
+        if not isinstance(val, dict):
+            continue
+        disabled = val.get("disabled") is True
+        rem = _coerce_finite_float(val.get("remaining_fraction"))
+        if not disabled and rem is None:
+            continue
+        raw_reset = val.get("reset_time")
+        reset_time = raw_reset.strip() if isinstance(raw_reset, str) else ""
+        items.append([str(key), disabled, repr(rem) if rem is not None else None, reset_time])
+    if not items:
+        return ""
+    return json.dumps(items, separators=(",", ":"), ensure_ascii=True)
+
+
+def _extract_quota_entries(quotas, now_ts):
+    """Normalize valid quota buckets from stdin into structured records."""
+    entries = {}
+    if not isinstance(quotas, dict):
+        return entries
+    for key, val in quotas.items():
+        if not isinstance(val, dict):
+            continue
+        bucket_key = str(key).strip()
+        if not bucket_key:
+            continue
+        disabled = val.get("disabled") is True
+        rem = _coerce_finite_float(val.get("remaining_fraction"))
+        if not disabled and rem is None:
+            continue
+        raw_reset = val.get("reset_time")
+        reset_time = raw_reset.strip() if isinstance(raw_reset, str) else ""
+        reset_epoch = _parse_iso_timestamp(reset_time) if reset_time else None
+        if reset_epoch is None:
+            res_sec = _coerce_finite_float(val.get("reset_in_seconds"))
+            if res_sec is not None:
+                reset_epoch = now_ts + res_sec
+        entries[bucket_key] = {
+            "bucket_key": bucket_key,
+            "remaining_fraction": rem,
+            "reset_time": reset_time,
+            "reset_epoch": reset_epoch,
+            "disabled": disabled,
+        }
+    return entries
+
+
+def _infer_sliding_fetch_ts(entries, now_ts, proc_start_ts=None):
+    """
+    Infer server fetch time from any unused 100% bucket whose reset_time slides
+    forward as server_now + window_duration on every refresh. Sanity-bounded so
+    unexpected window lengths are ignored.
+    """
+    candidates = []
+    for bucket_key, entry in entries.items():
+        if entry["disabled"]:
+            continue
+        rem = entry["remaining_fraction"]
+        reset_epoch = entry["reset_epoch"]
+        if rem is None or rem < 1.0 - 1e-6 or reset_epoch is None or not entry["reset_time"]:
+            continue
+        _, window = _parse_quota_key(bucket_key)
+        window_sec = _QUOTA_WINDOW_DURATIONS.get(window)
+        if not window_sec:
+            continue
+        inferred = reset_epoch - window_sec
+        if inferred > now_ts + 120.0:
+            continue
+        if inferred < now_ts - 7 * 86400.0:
+            continue
+        if proc_start_ts is not None and inferred < proc_start_ts - 120.0:
+            continue
+        candidates.append(inferred)
+    return max(candidates) if candidates else None
+
+
+def _should_replace_bucket(cached, incoming, now_ts):
+    """
+    Decide whether an incoming bucket observation should replace a cached entry.
+    Confirmed state-transition refreshes supersede cold-start entries and follow
+    chronological arrival order (handling non-monotonic server jitter cleanly).
+    """
+    if cached is None:
+        return True
+
+    cached_reset = cached.get("reset_epoch")
+    incoming_reset = incoming.get("reset_epoch")
+
+    # 1. Active newer window always beats an already-expired window.
+    if cached_reset is not None and incoming_reset is not None:
+        if cached_reset <= now_ts and incoming_reset > cached_reset + _WINDOW_ROLLOVER_GRACE_SECONDS:
+            return True
+        if incoming_reset <= now_ts and cached_reset > incoming_reset + _WINDOW_ROLLOVER_GRACE_SECONDS:
+            return False
+
+    # 2. Expire stale cache records so long-idle accounts always recover.
+    if (now_ts - cached["observed_at"]) > _CACHE_MAX_STALE_SECONDS:
+        return True
+
+    # 3. Confirmed refreshes strictly outrank unconfirmed cold-start snapshots.
+    if incoming["confidence"] > cached["confidence"]:
+        return True
+    if incoming["confidence"] < cached["confidence"]:
+        return False
+
+    # 4. Both confirmed: latest observed server refresh wins (immune to jitter).
+    if incoming["confidence"] >= _QUOTA_CONFIDENCE_CONFIRMED:
+        return incoming["observed_at"] >= cached["observed_at"]
+
+    # 5. Both cold-start: prefer newer window, then sliding server clock, then lower quota.
+    if cached_reset is not None and incoming_reset is not None:
+        if abs(incoming_reset - cached_reset) > _WINDOW_ROLLOVER_GRACE_SECONDS:
+            return incoming_reset > cached_reset
+
+    cached_inferred = cached.get("inferred_fetch_ts")
+    incoming_inferred = incoming.get("inferred_fetch_ts")
+    if cached_inferred is not None and incoming_inferred is not None:
+        if abs(incoming_inferred - cached_inferred) > 1.0:
+            return incoming_inferred > cached_inferred
+
+    if not cached["disabled"] and not incoming["disabled"]:
+        c_rem = cached.get("remaining_fraction")
+        i_rem = incoming.get("remaining_fraction")
+        if c_rem is not None and i_rem is not None:
+            return i_rem < c_rem - 1e-6
+
+    return False
+
+
+def _should_use_cached_bucket(cached, incoming, now_ts, can_trust_terminal):
+    """Return True if cached should be rendered in place of incoming."""
+    if cached is None:
+        return False
+    if (now_ts - cached["observed_at"]) > _CACHE_MAX_STALE_SECONDS:
+        return False
+    cached_reset = cached.get("reset_epoch")
+    incoming_reset = incoming.get("reset_epoch")
+    if (
+        cached_reset is not None
+        and incoming_reset is not None
+        and cached_reset <= now_ts
+        and incoming_reset > cached_reset + _WINDOW_ROLLOVER_GRACE_SECONDS
+    ):
+        return False
+    if not can_trust_terminal:
+        return not _should_replace_bucket(cached, incoming, now_ts)
+    return True
+
+
+def _build_merged_quota_map(raw_quotas, incoming_entries, cached_buckets, now_ts, can_trust_terminal):
+    """Merge fresher cached buckets onto raw_quotas with live recomputed countdowns."""
+    merged = {}
+    for key, val in raw_quotas.items():
+        if not isinstance(val, dict):
+            merged[key] = val
+            continue
+        bucket_key = str(key).strip()
+        incoming = incoming_entries.get(bucket_key)
+        cached = cached_buckets.get(bucket_key)
+        if incoming is not None and _should_use_cached_bucket(
+            cached, incoming, now_ts, can_trust_terminal
+        ):
+            updated = dict(val)
+            if cached["disabled"]:
+                updated["disabled"] = True
+                if cached["remaining_fraction"] is not None:
+                    updated["remaining_fraction"] = cached["remaining_fraction"]
+                else:
+                    updated.pop("remaining_fraction", None)
+            else:
+                updated.pop("disabled", None)
+                if cached["remaining_fraction"] is not None:
+                    updated["remaining_fraction"] = cached["remaining_fraction"]
+            if cached["reset_time"]:
+                updated["reset_time"] = cached["reset_time"]
+            if cached["reset_epoch"] is not None:
+                updated["reset_in_seconds"] = max(0, int(cached["reset_epoch"] - now_ts))
+            merged[key] = updated
+        else:
+            merged[key] = val
+    return merged
+
+
+def _resolve_quota_cache_db_path():
+    """Return the shared quota SQLite cache path, or '' when explicitly disabled."""
+    disabled_flag = os.environ.get("AGY_STATUSLINE_SHARED_QUOTA", "").strip().lower()
+    if disabled_flag in ("0", "false", "no", "off"):
+        return ""
+    override = os.environ.get("AGY_STATUSLINE_QUOTA_DB", "").strip()
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    return os.path.join(
+        os.path.expanduser("~/.gemini/antigravity-cli"),
+        "cache",
+        "statusline_quota.db",
+    )
+
+
+def _init_quota_cache_db(con):
+    """Initialize WAL mode and schema for the shared cross-terminal quota cache."""
+    con.execute("PRAGMA busy_timeout=150")
+    mode_row = con.execute("PRAGMA journal_mode").fetchone()
+    if not mode_row or str(mode_row[0]).lower() != "wal":
+        con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS terminal_state (
+                account_key TEXT NOT NULL,
+                terminal_id TEXT NOT NULL,
+                last_fp TEXT NOT NULL,
+                last_seen_at REAL NOT NULL,
+                PRIMARY KEY (account_key, terminal_id)
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS quota_cache (
+                account_key TEXT NOT NULL,
+                bucket_key TEXT NOT NULL,
+                remaining_fraction REAL,
+                reset_time TEXT NOT NULL,
+                reset_epoch REAL,
+                disabled INTEGER NOT NULL,
+                confidence INTEGER NOT NULL,
+                observed_at REAL NOT NULL,
+                inferred_fetch_ts REAL,
+                source_terminal TEXT NOT NULL,
+                PRIMARY KEY (account_key, bucket_key)
+            )
+            """
+        )
+        con.execute("COMMIT")
+    except Exception:
+        if con.in_transaction:
+            con.execute("ROLLBACK")
+        raise
+    finally:
+        con.execute("PRAGMA busy_timeout=50")
+
+
+def _read_quota_cache_rows(con, account_key):
+    """Load all cached quota buckets for account_key as a dict."""
+    rows = con.execute(
+        """
+        SELECT bucket_key, remaining_fraction, reset_time, reset_epoch,
+               disabled, confidence, observed_at, inferred_fetch_ts, source_terminal
+        FROM quota_cache
+        WHERE account_key = ?
+        """,
+        (account_key,),
+    ).fetchall()
+    cached = {}
+    for (
+        bucket_key,
+        rem_frac,
+        reset_time,
+        reset_epoch,
+        disabled,
+        confidence,
+        observed_at,
+        inferred_fetch_ts,
+        source_terminal,
+    ) in rows:
+        cached[bucket_key] = {
+            "bucket_key": bucket_key,
+            "remaining_fraction": rem_frac,
+            "reset_time": reset_time or "",
+            "reset_epoch": reset_epoch,
+            "disabled": bool(disabled),
+            "confidence": int(confidence),
+            "observed_at": float(observed_at),
+            "inferred_fetch_ts": inferred_fetch_ts,
+            "source_terminal": source_terminal or "",
+        }
+    return cached
+
+
+def _is_corrupt_sqlite_error(exc):
+    """Return True if exc signals a malformed/non-database SQLite file."""
+    msg = str(exc).lower()
+    return "malformed" in msg or "not a database" in msg
+
+
+def _is_safe_cache_unlink_target(path):
+    """Only auto-remove corrupt cache files that clearly look like a regular .db file."""
+    return bool(
+        path
+        and path.lower().endswith(".db")
+        and not os.path.islink(path)
+    )
+
+
+def _classify_observation_confidence(existing_term_row, proc_start_ts, now_ts):
+    """Return CONFIRMED for observed transitions or newly launched agy processes, else COLD."""
+    if existing_term_row is not None:
+        return _QUOTA_CONFIDENCE_CONFIRMED
+    if proc_start_ts is not None and -5.0 <= (now_ts - proc_start_ts) <= _FRESH_PROCESS_WINDOW_SECONDS:
+        return _QUOTA_CONFIDENCE_CONFIRMED
+    return _QUOTA_CONFIDENCE_COLD
+
+
+def _commit_quota_update(
+    con,
+    account_key,
+    terminal_id,
+    proc_start_ts,
+    fp,
+    incoming_entries,
+    inferred_ts,
+    now_ts,
+):
+    """
+    Record terminal state and conditionally update quota_cache inside a single
+    BEGIN IMMEDIATE transaction. Returns the up-to-date cached_buckets dict.
+    """
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        tx_term = con.execute(
+            "SELECT last_fp, last_seen_at FROM terminal_state "
+            "WHERE account_key = ? AND terminal_id = ?",
+            (account_key, terminal_id),
+        ).fetchone()
+
+        if not incoming_entries:
+            if tx_term is None:
+                con.execute(
+                    "INSERT OR REPLACE INTO terminal_state "
+                    "(account_key, terminal_id, last_fp, last_seen_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (account_key, terminal_id, "", now_ts),
+                )
+            con.execute("COMMIT")
+            return {}
+
+        fp_changed = tx_term is None or tx_term[0] != fp
+        confidence = _classify_observation_confidence(tx_term, proc_start_ts, now_ts)
+
+        con.execute(
+            "INSERT OR REPLACE INTO terminal_state "
+            "(account_key, terminal_id, last_fp, last_seen_at) "
+            "VALUES (?, ?, ?, ?)",
+            (account_key, terminal_id, fp, now_ts),
+        )
+
+        cached_buckets = _read_quota_cache_rows(con, account_key)
+        if fp_changed:
+            for bucket_key, entry in incoming_entries.items():
+                candidate = {
+                    **entry,
+                    "confidence": confidence,
+                    "observed_at": now_ts,
+                    "inferred_fetch_ts": inferred_ts,
+                    "source_terminal": terminal_id,
+                }
+                if _should_replace_bucket(cached_buckets.get(bucket_key), candidate, now_ts):
+                    con.execute(
+                        """
+                        INSERT OR REPLACE INTO quota_cache (
+                            account_key, bucket_key, remaining_fraction,
+                            reset_time, reset_epoch, disabled, confidence,
+                            observed_at, inferred_fetch_ts, source_terminal
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            account_key,
+                            bucket_key,
+                            candidate["remaining_fraction"],
+                            candidate["reset_time"],
+                            candidate["reset_epoch"],
+                            1 if candidate["disabled"] else 0,
+                            candidate["confidence"],
+                            candidate["observed_at"],
+                            candidate["inferred_fetch_ts"],
+                            candidate["source_terminal"],
+                        ),
+                    )
+                    cached_buckets[bucket_key] = candidate
+
+        prune_cutoff = now_ts - _TERMINAL_PRUNE_AGE_SECONDS
+        con.execute(
+            "DELETE FROM terminal_state WHERE last_seen_at < ?",
+            (prune_cutoff,),
+        )
+        con.execute(
+            "DELETE FROM quota_cache WHERE observed_at < ?",
+            (prune_cutoff,),
+        )
+
+        con.execute("COMMIT")
+        return cached_buckets
+    except Exception:
+        if con.in_transaction:
+            con.execute("ROLLBACK")
+        raise
+
+
+def sync_shared_quota(data, db_path=None, _now=None, _terminal_identity=_UNSET):
+    """
+    Synchronize quota buckets across concurrent agy terminals on the same account
+    using per-terminal state-transition detection backed by a local SQLite WAL DB.
+
+    Returns a shallow copy of data with fresher synced quota buckets when available,
+    or the original data unchanged on missing email/quota or any storage error.
+    """
+    if not isinstance(data, dict):
+        return data
+
+    raw_email = data.get("email")
+    if not isinstance(raw_email, str) or not raw_email.strip():
+        return data
+    account_key = raw_email.strip().lower()
+
+    if isinstance(data.get("quota"), dict):
+        quota_field = "quota"
+        raw_quotas = data["quota"]
+    elif isinstance(data.get("quotas"), dict):
+        quota_field = "quotas"
+        raw_quotas = data["quotas"]
+    else:
+        quota_field = None
+        raw_quotas = None
+
+    resolved_path = _resolve_quota_cache_db_path() if db_path is None else str(db_path)
+    if not resolved_path:
+        return data
+
+    now_ts = time.time() if _now is None else float(_now)
+    if _terminal_identity is _UNSET:
+        terminal_id, proc_start_ts = _get_terminal_identity()
+    elif isinstance(_terminal_identity, tuple) and len(_terminal_identity) == 2:
+        terminal_id, proc_start_ts = _terminal_identity
+    else:
+        terminal_id, proc_start_ts = None, None
+
+    if raw_quotas:
+        fp = _quota_fingerprint(raw_quotas)
+        incoming_entries = _extract_quota_entries(raw_quotas, now_ts) if fp else {}
+    else:
+        fp = ""
+        incoming_entries = {}
+
+    # Pre-quota frames only need to register a brand-new terminal once so its
+    # subsequent first quota arrival counts as a confirmed state transition.
+    if not incoming_entries and terminal_id is None:
+        return data
+
+    db_exists = os.path.isfile(resolved_path)
+    if not db_exists and terminal_id is None:
+        return data
+
+    inferred_ts = (
+        _infer_sliding_fetch_ts(incoming_entries, now_ts, proc_start_ts)
+        if incoming_entries
+        else None
+    )
+
+    try:
+        if not db_exists:
+            parent = os.path.dirname(os.path.abspath(resolved_path))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+
+        with closing(sqlite3.connect(resolved_path, timeout=0.05, isolation_level=None)) as con:
+            con.execute("PRAGMA busy_timeout=50")
+
+            schema_ready = db_exists
+            term_row = None
+            cached_buckets = {}
+
+            if schema_ready:
+                try:
+                    if terminal_id is not None:
+                        term_row = con.execute(
+                            "SELECT last_fp, last_seen_at FROM terminal_state "
+                            "WHERE account_key = ? AND terminal_id = ?",
+                            (account_key, terminal_id),
+                        ).fetchone()
+                    if incoming_entries:
+                        cached_buckets = _read_quota_cache_rows(con, account_key)
+                except sqlite3.OperationalError as exc:
+                    if "no such table" in str(exc).lower():
+                        schema_ready = False
+                    else:
+                        raise
+
+            if not schema_ready:
+                if terminal_id is None:
+                    return data
+                _init_quota_cache_db(con)
+                if incoming_entries:
+                    cached_buckets = _read_quota_cache_rows(con, account_key)
+
+            # Decide whether a write transaction is needed (99% of ticks are read-only).
+            if not incoming_entries:
+                need_write = terminal_id is not None and term_row is None
+            else:
+                need_write = terminal_id is not None and (
+                    term_row is None
+                    or term_row[0] != fp
+                    or (now_ts - float(term_row[1])) >= _TERMINAL_TOUCH_INTERVAL_SECONDS
+                )
+
+            write_succeeded = not need_write
+            if need_write:
+                try:
+                    updated_cache = _commit_quota_update(
+                        con,
+                        account_key,
+                        terminal_id,
+                        proc_start_ts,
+                        fp,
+                        incoming_entries,
+                        inferred_ts,
+                        now_ts,
+                    )
+                    if incoming_entries:
+                        cached_buckets = updated_cache
+                    write_succeeded = True
+                except sqlite3.Error as exc:
+                    if _is_corrupt_sqlite_error(exc):
+                        raise
+                    # Transient lock or read-only DB: fall back to comparing against
+                    # cached_buckets without letting stale cache overwrite a fresh local refresh.
+
+            if not incoming_entries or not cached_buckets:
+                return data
+
+            can_trust_cache_override = terminal_id is not None and (
+                write_succeeded or (term_row is not None and term_row[0] == fp)
+            )
+            if can_trust_cache_override:
+                incoming_for_merge = incoming_entries
+            else:
+                fallback_confidence = (
+                    _classify_observation_confidence(term_row, proc_start_ts, now_ts)
+                    if terminal_id is not None
+                    else _QUOTA_CONFIDENCE_COLD
+                )
+                incoming_for_merge = {
+                    bucket_key: {
+                        **entry,
+                        "confidence": fallback_confidence,
+                        "observed_at": now_ts,
+                        "inferred_fetch_ts": inferred_ts,
+                    }
+                    for bucket_key, entry in incoming_entries.items()
+                }
+
+            merged_quotas = _build_merged_quota_map(
+                raw_quotas,
+                incoming_for_merge,
+                cached_buckets,
+                now_ts,
+                can_trust_terminal=can_trust_cache_override,
+            )
+            result = dict(data)
+            result[quota_field] = merged_quotas
+            return result
+    except sqlite3.DatabaseError as exc:
+        if _is_corrupt_sqlite_error(exc) and _is_safe_cache_unlink_target(resolved_path):
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    os.unlink(resolved_path + suffix)
+                except OSError:
+                    pass
+        return data
+    except Exception:
+        return data
+
+
 def render_statusline(data, _now=None):
     """Render the 2-line HUD status string from Antigravity state data."""
     # === 1. Line 1: Model, Directory, Git Branch, Agent State and Mode, Working Duration ===
@@ -1058,6 +2086,11 @@ def main():
     except Exception:
         print("🧠 Context: Ready")
         return
+
+    try:
+        data = sync_shared_quota(data)
+    except Exception:
+        pass
 
     try:
         print(render_statusline(data))

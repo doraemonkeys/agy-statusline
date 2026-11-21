@@ -22,7 +22,7 @@ A sleek, real-time two-line HUD statusline for **Google Antigravity CLI (`agy`)*
   - 🟢 Green (< 60%)
   - 🟡 Yellow (60% - 85%)
   - 🔴 Red (≥ 85%)
-- ⏳ **5-Hour Quota Tracker** — Real-time rolling quota percentage and countdown to quota reset (e.g., `95% (4h 56m)`).
+- ⏳ **5-Hour Quota Tracker** — Real-time rolling quota percentage and countdown to quota reset (e.g., `95% (4h 56m)`), matched to the active model's quota group (`gemini-*` vs `3p-*`) and automatically synced across concurrent terminals on the same account via a local SQLite WAL cache.
 - 📅 **Weekly Quota Tracker** — Weekly quota percentage and reset countdown (e.g., `99% (167h 56m)`).
 - 🪶 **Zero Dependencies** — Built entirely with standard library Python (`sys`, `json`, `os`, `sqlite3`, `time`). Works out-of-the-box on Windows, macOS, and Linux.
 
