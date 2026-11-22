@@ -276,6 +276,168 @@ class DurationFormattingTests(unittest.TestCase):
         self.assertIn("/ 18m 30s", explicit_both)
 
 
+class ContextWindowTests(unittest.TestCase):
+    def test_format_tokens_precision_and_boundaries(self):
+        cases = (
+            (0, "0"),
+            (999, "999"),
+            (1_000, "1.0k"),
+            (200_000, "200.0k"),
+            (327_133, "327.1k"),
+            (999_949, "999.9k"),
+            (999_950, "1.0M"),
+            (1_000_000, "1.0M"),
+            (1_048_576, "1.05M"),
+            (1_280_000, "1.28M"),
+            (1_500_000, "1.5M"),
+            (2_000_000, "2.0M"),
+            (2_097_152, "2.1M"),
+        )
+        for value, expected in cases:
+            with self.subTest(value=value):
+                self.assertEqual(statusline.format_tokens(value), expected)
+
+        for invalid in (None, True, False, -1, float("nan"), float("inf"), "bad"):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(statusline.format_tokens(invalid), "0")
+
+    def test_prefers_current_usage_over_cumulative_outputs_and_local_estimate(self):
+        # Exact regression from real agy session: total_output_tokens is cumulative
+        # across all turns (96.4k) and must NOT be added onto total_input_tokens (317.2k).
+        windshare_cw = {
+            "total_input_tokens": 317_161,
+            "total_output_tokens": 96_429,
+            "context_window_size": 1_048_576,
+            "used_percentage": 317_161 / 1_048_576 * 100.0,
+            "current_usage": {
+                "input_tokens": 326_964,
+                "output_tokens": 169,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+            },
+        }
+        _, line2 = statusline.render_statusline({"context_window": windshare_cw}).splitlines()
+        self.assertIn("327.1k/1.05M (31.2%)", line2)
+        self.assertNotIn("413.6k", line2)
+
+        # Cache-hit turn where input_tokens is small and cache_read holds the prompt prefix.
+        cache_hit_cw = {
+            "total_input_tokens": 208_863,
+            "total_output_tokens": 48_000,
+            "context_window_size": 1_048_576,
+            "used_percentage": 208_863 / 1_048_576 * 100.0,
+            "current_usage": {
+                "input_tokens": 7_320,
+                "output_tokens": 162,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 260_663,
+            },
+        }
+        _, line2 = statusline.render_statusline({"context_window": cache_hit_cw}).splitlines()
+        self.assertIn("268.1k/1.05M (25.6%)", line2)
+
+        # Official doc shape with legacy inflated used_percentage (from cumulative output).
+        doc_cw = {
+            "total_input_tokens": 88_244,
+            "total_output_tokens": 61_074,
+            "context_window_size": 1_048_576,
+            "used_percentage": 14.24,
+            "current_usage": {
+                "input_tokens": 63_382,
+                "output_tokens": 346,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 20_857,
+            },
+        }
+        _, line2 = statusline.render_statusline({"context_window": doc_cw}).splitlines()
+        self.assertIn("84.6k/1.05M (8.1%)", line2)
+
+        # Provider reporting non-zero cache_creation_input_tokens sums all 4 components.
+        claude_cw = {
+            "total_input_tokens": 900_000,
+            "total_output_tokens": 45_000,
+            "context_window_size": 200_000,
+            "used_percentage": 55.0,
+            "current_usage": {
+                "input_tokens": 200,
+                "output_tokens": 800,
+                "cache_creation_input_tokens": 40_000,
+                "cache_read_input_tokens": 70_000,
+            },
+        }
+        _, line2 = statusline.render_statusline({"context_window": claude_cw}).splitlines()
+        self.assertIn("111.0k/200.0k (55.5%)", line2)
+
+    def test_guards_against_dropped_cache_write_tokens_in_current_usage(self):
+        # agy currently leaves cache_creation_input_tokens=0; if a provider bills the
+        # bulk of a prompt as cache-write tokens, current_usage collapses far below
+        # agy's pre-request estimate (total_input_tokens matching used_percentage).
+        dropped_cache_write_cw = {
+            "total_input_tokens": 120_000,
+            "total_output_tokens": 15_000,
+            "context_window_size": 200_000,
+            "used_percentage": 60.0,
+            "current_usage": {
+                "input_tokens": 15,
+                "output_tokens": 500,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+            },
+        }
+        _, line2 = statusline.render_statusline(
+            {"context_window": dropped_cache_write_cw}
+        ).splitlines()
+        self.assertIn("120.0k/200.0k (60.0%)", line2)
+
+    def test_fallbacks_without_current_usage_stay_consistent(self):
+        # agy without current_usage: total_input_tokens matches used_percentage, ignores cumulative output.
+        agy_no_cur = {
+            "total_input_tokens": 317_161,
+            "total_output_tokens": 96_429,
+            "context_window_size": 1_048_576,
+            "used_percentage": 30.2,
+            "current_usage": None,
+        }
+        _, line2 = statusline.render_statusline({"context_window": agy_no_cur}).splitlines()
+        self.assertIn("317.2k/1.05M (30.2%)", line2)
+
+        # Cumulative-input CLI without current_usage: derives token count from used_percentage.
+        cumulative_cli = {
+            "total_input_tokens": 5_000_000,
+            "total_output_tokens": 150_000,
+            "context_window_size": 200_000,
+            "used_percentage": 42.0,
+        }
+        _, line2 = statusline.render_statusline({"context_window": cumulative_cli}).splitlines()
+        self.assertIn("84.0k/200.0k (42.0%)", line2)
+
+        # Neither current_usage nor used_percentage: uses total_input_tokens alone (never adds total_output_tokens).
+        input_only = {
+            "total_input_tokens": 150_000,
+            "total_output_tokens": 90_000,
+            "context_window_size": 1_000_000,
+        }
+        _, line2 = statusline.render_statusline({"context_window": input_only}).splitlines()
+        self.assertIn("150.0k/1.0M (15.0%)", line2)
+
+        # Empty, startup (size=0), and malformed inputs fail safely.
+        for bad_cw in (
+            None,
+            {},
+            "invalid",
+            {
+                "total_input_tokens": True,
+                "total_output_tokens": -50,
+                "context_window_size": 0,
+                "used_percentage": float("nan"),
+                "current_usage": {"input_tokens": -10, "output_tokens": "bad"},
+            },
+        ):
+            with self.subTest(bad_cw=bad_cw):
+                _, line2 = statusline.render_statusline({"context_window": bad_cw}).splitlines()
+                self.assertIn("0/1.0M (0.0%)", line2)
+
+
 class ExecutionModeTests(unittest.TestCase):
     def test_displays_reported_modes_next_to_agent_state(self):
         for mode in ("plan", "auto", "accept-edits"):
@@ -1062,6 +1224,17 @@ class StatuslineInputTests(unittest.TestCase):
             completed.stdout.decode("utf-8").splitlines(),
             statusline.render_statusline(data).splitlines(),
         )
+
+    def test_preview_mode_renders_self_consistent_context(self):
+        completed = subprocess.run(
+            [*self.command, "--preview"],
+            capture_output=True,
+            check=True,
+            timeout=4,
+        )
+        self.assertEqual(completed.stderr, b"")
+        output = completed.stdout.decode("utf-8")
+        self.assertIn("256.8k/1.05M (24.5%)", output)
 
     def test_exits_when_stdin_stays_open(self):
         data = {"model": "Gemini 輸入"}

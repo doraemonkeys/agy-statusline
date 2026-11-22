@@ -6,7 +6,7 @@
 
 ```text
 🤖 4 Argon (High) [gemini-4-argon-trial] │ 📁 my-project │ 🌿 main │ ⚡ reviewing · [plan] │ ⏱️ 42s / 18m 30s
-🧠 Context ██░░░░░░░░ 244.6k/1.0M (24.5%) │ ⏳ 5h: 95% (4h 56m) │ 📅 Wk: 99% (167h 56m)
+🧠 Context ██░░░░░░░░ 256.8k/1.05M (24.5%) │ ⏳ 5h: 95% (4h 56m) │ 📅 Wk: 99% (167h 56m)
 ```
 
 ---
@@ -18,7 +18,7 @@
 - 🌿 **极速 Git 分支检测** — 通过向上遍历目录直接解析 `.git/HEAD` 文件（原生兼容主分支、Git Worktree 与 Submodule），**不启动任何 Git 子进程**，零性能损耗、毫秒级响应。
 - ⚡ **Agent 状态与执行模式** — 实时显示 Agent 当前状态和 agy 上报的执行模式，例如 `⚡ idle · [plan]`。
 - ⏱️ **本轮与会话持续时长** — 同屏展示 **本轮持续时长 / 会话总持续时长**（如 `⏱️ 42s / 18m 30s`）；执行中实时计时并以黄色高亮，进入空闲后自动定格上一轮实际耗时。
-- 🧠 **Context 进度条与 Token 统计** — 直观展示上下文用量进度条（`██░░░░░░░░`）与 Token 计数（如 `244.6k/1.0M`），三段颜色预警：
+- 🧠 **Context 进度条与 Token 统计** — 直观展示上下文用量进度条（`██░░░░░░░░`）与真实当轮 Token 计数（如 `256.8k/1.05M`），三段颜色预警：
   - 🟢 绿色（< 60%）
   - 🟡 黄色（60% - 85%）
   - 🔴 红色（≥ 85%）
@@ -85,7 +85,7 @@ python -S statusline.py --preview
 效果输出：
 ```text
 🤖 4 Argon (High) [gemini-4-argon-trial] │ 📁 agy-statusline │ 🌿 main │ ⚡ reviewing · [plan] │ ⏱️ 42s / 18m 30s
-🧠 Context ██░░░░░░░░ 244.6k/1.0M (24.5%) │ ⏳ 5h: 95% (4h 56m) │ 📅 Wk: 99% (167h 56m)
+🧠 Context ██░░░░░░░░ 256.8k/1.05M (24.5%) │ ⏳ 5h: 95% (4h 56m) │ 📅 Wk: 99% (167h 56m)
 ```
 
 运行 WAL 读取、连接释放、时长统计和安装命令执行的回归检查：
@@ -103,7 +103,7 @@ Google Antigravity CLI (`agy`) 在每次交互更新时，都会将当前环境�
 - `cwd` / `workspace`: 当前工作目录
 - `agent_state` / `cycle_mode`: Agent 当前活动状态与 agy 上报的执行模式
 - `session` / `turn` / 会话轨迹 `steps`: 本轮持续时长与会话总持续时长（复用同一次只读 SQLite 连接，零额外连接开销）
-- `context_window`: 当前使用的 Token 数、最大 Token 限制及使用比例
+- `context_window`: 优先取 `current_usage` 的当轮真实上下文 Token（无该字段时回退到 `total_input_tokens` / `used_percentage`，避免把全会话累计 `total_output_tokens` 重复计入）、最大窗口上限与一致的占用比例
 - `quota`: 5 小时滚动配额、每周配额及重置秒数倒计时
 
 最后格式化为带有 ANSI 颜色高亮的两行文本输出给 Antigravity HUD 渲染。

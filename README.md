@@ -6,7 +6,7 @@ A sleek, real-time two-line HUD statusline for **Google Antigravity CLI (`agy`)*
 
 ```text
 🤖 4 Argon (High) [gemini-4-argon-trial] │ 📁 my-project │ 🌿 main │ ⚡ reviewing · [plan] │ ⏱️ 42s / 18m 30s
-🧠 Context ██░░░░░░░░ 244.6k/1.0M (24.5%) │ ⏳ 5h: 95% (4h 56m) │ 📅 Wk: 99% (167h 56m)
+🧠 Context ██░░░░░░░░ 256.8k/1.05M (24.5%) │ ⏳ 5h: 95% (4h 56m) │ 📅 Wk: 99% (167h 56m)
 ```
 
 ---
@@ -85,7 +85,7 @@ python -S statusline.py --preview
 Output:
 ```text
 🤖 4 Argon (High) [gemini-4-argon-trial] │ 📁 agy-statusline │ 🌿 main │ ⚡ reviewing · [plan] │ ⏱️ 42s / 18m 30s
-🧠 Context ██░░░░░░░░ 244.6k/1.0M (24.5%) │ ⏳ 5h: 95% (4h 56m) │ 📅 Wk: 99% (167h 56m)
+🧠 Context ██░░░░░░░░ 256.8k/1.05M (24.5%) │ ⏳ 5h: 95% (4h 56m) │ 📅 Wk: 99% (167h 56m)
 ```
 
 Run the regression checks for WAL reads, connection cleanup, duration tracking, and installed command execution:
@@ -103,7 +103,7 @@ Google Antigravity CLI (`agy`) supports custom status lines by streaming a JSON 
 - `cwd` / `workspace`: Active project directory
 - `agent_state` / `cycle_mode`: Current agent activity and the selected execution mode when agy reports it
 - `session` / `turn` / trajectory `steps`: Current turn duration and total session elapsed time (queried in the same single read-only SQLite pass)
-- `context_window`: Token usage, maximum context limit, and percentage
+- `context_window`: Exact latest-turn token usage from `current_usage` (falling back to `total_input_tokens` / `used_percentage` without double-counting cumulative `total_output_tokens`), window capacity, and consistent usage percentage
 - `quota`: 5-hour rolling and weekly rate limits and countdown seconds
 
 It then outputs ANSI color-formatted text that Antigravity renders above the interactive prompt.

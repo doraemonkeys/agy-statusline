@@ -30,16 +30,23 @@ RED = "\033[31m"
 
 
 def format_tokens(n):
-    """Format token count into human-readable strings (e.g. 1.2k, 630.6k, 1.0M)."""
+    """Format token count into human-readable strings (e.g. 1.2k, 327.1k, 1.0M, 1.05M)."""
+    if n is None or isinstance(n, bool):
+        return "0"
     try:
         n = float(n)
-        if n >= 1_000_000:
-            return f"{n / 1_000_000:.1f}M"
-        if n >= 1_000:
-            return f"{n / 1_000:.1f}k"
-        return str(int(n))
     except Exception:
         return "0"
+    if not math.isfinite(n) or n < 0:
+        return "0"
+    if n >= 999_950:
+        hundredths = int(round((n / 1_000_000.0) * 100))
+        if hundredths % 10 != 0:
+            return f"{hundredths / 100:.2f}M"
+        return f"{hundredths / 100:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}k"
+    return str(int(n))
 
 
 def format_time_remaining(seconds):
@@ -1836,6 +1843,99 @@ def sync_shared_quota(data, db_path=None, _now=None, _terminal_identity=_UNSET):
         return data
 
 
+def _coerce_nonneg_float(val):
+    """Convert a numeric value into a finite non-negative float, or None."""
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        num = float(val)
+    except Exception:
+        return None
+    if not math.isfinite(num) or num < 0:
+        return None
+    return num
+
+
+def _pct_matches(candidate_pct, reported_pct):
+    """Return True if reported_pct matches candidate_pct (raw or rounded to 1-2 decimals)."""
+    diff = abs(candidate_pct - reported_pct)
+    if diff <= 0.0051:
+        return True
+    if candidate_pct >= 0.5 and abs(reported_pct * 10.0 - round(reported_pct * 10.0)) < 1e-6:
+        return diff <= 0.0501
+    return False
+
+
+def resolve_context_window(cw):
+    """
+    Resolve (used_tokens, max_tokens, used_pct) from a context_window payload.
+
+    Prefer exact latest-call API usage from `current_usage` (uncached input +
+    cache creation + cache read + latest call output) and compute `used_pct`
+    from the same numerator and denominator so count, bar, and percentage stay
+    consistent. Never add session-cumulative `total_output_tokens` onto the
+    current context window count.
+    """
+    if not isinstance(cw, dict):
+        cw = {}
+
+    raw_max = _coerce_nonneg_float(cw.get("context_window_size"))
+    max_tokens = raw_max if (raw_max is not None and raw_max > 0) else 1_000_000.0
+
+    reported_pct = _coerce_nonneg_float(cw.get("used_percentage"))
+    total_input = _coerce_nonneg_float(cw.get("total_input_tokens"))
+    input_matches_pct = (
+        total_input is not None
+        and total_input > 0
+        and reported_pct is not None
+        and _pct_matches((total_input / max_tokens) * 100.0, reported_pct)
+    )
+
+    current_tokens = None
+    cache_creation = 0.0
+    current_usage = cw.get("current_usage")
+    if isinstance(current_usage, dict):
+        cur_in = _coerce_nonneg_float(current_usage.get("input_tokens"))
+        cur_cache_create = _coerce_nonneg_float(current_usage.get("cache_creation_input_tokens"))
+        cur_cache_read = _coerce_nonneg_float(current_usage.get("cache_read_input_tokens"))
+        cur_out = _coerce_nonneg_float(current_usage.get("output_tokens"))
+        parts = [v for v in (cur_in, cur_cache_create, cur_cache_read, cur_out) if v is not None]
+        if parts:
+            candidate = sum(parts)
+            if candidate > 0:
+                current_tokens = candidate
+                cache_creation = cur_cache_create or 0.0
+
+    # Guard against agy leaving cache_creation_input_tokens=0 when a provider
+    # reports cache-write tokens separately from input_tokens, which would make
+    # current_usage appear drastically smaller than the pre-request estimate.
+    if (
+        current_tokens is not None
+        and cache_creation == 0.0
+        and input_matches_pct
+        and current_tokens < 0.5 * total_input
+    ):
+        current_tokens = None
+
+    if current_tokens is not None:
+        used_tokens = current_tokens
+        used_pct = (used_tokens / max_tokens) * 100.0
+        return used_tokens, max_tokens, used_pct
+
+    if reported_pct is not None:
+        if input_matches_pct:
+            used_tokens = total_input
+            used_pct = (used_tokens / max_tokens) * 100.0
+        else:
+            used_pct = reported_pct
+            used_tokens = (used_pct / 100.0) * max_tokens
+        return used_tokens, max_tokens, used_pct
+
+    used_tokens = total_input if total_input is not None else 0.0
+    used_pct = (used_tokens / max_tokens) * 100.0
+    return used_tokens, max_tokens, used_pct
+
+
 def render_statusline(data, _now=None):
     """Render the 2-line HUD status string from Antigravity state data."""
     # === 1. Line 1: Model, Directory, Git Branch, Agent State and Mode, Working Duration ===
@@ -1938,35 +2038,10 @@ def render_statusline(data, _now=None):
     line2_items = []
 
     # (1) Context Window & Progress Bar
-    cw = data.get("context_window")
-    if not isinstance(cw, dict):
-        cw = {}
-
-    input_tokens = cw.get("total_input_tokens") or 0
-    output_tokens = cw.get("total_output_tokens") or 0
-    try:
-        total_tokens = float(input_tokens) + float(output_tokens)
-    except Exception:
-        total_tokens = 0
-
-    max_tokens = cw.get("context_window_size") or 1_000_000
-    try:
-        max_tokens = float(max_tokens)
-    except Exception:
-        max_tokens = 1_000_000.0
-
-    used_pct = cw.get("used_percentage")
-    if used_pct is None:
-        used_pct = (total_tokens / max_tokens * 100) if max_tokens > 0 else 0.0
-    else:
-        try:
-            used_pct = float(used_pct)
-        except Exception:
-            used_pct = 0.0
-
+    used_tokens, max_tokens, used_pct = resolve_context_window(data.get("context_window"))
     progress_bar = make_progress_bar(used_pct, width=10)
     line2_items.append(
-        f"🧠 {BOLD}Context{RESET} {progress_bar} {format_tokens(total_tokens)}/{format_tokens(max_tokens)} ({used_pct:.1f}%)"
+        f"🧠 {BOLD}Context{RESET} {progress_bar} {format_tokens(used_tokens)}/{format_tokens(max_tokens)} ({used_pct:.1f}%)"
     )
 
     # (2) Quotas: 5h & Weekly (scoped to the active model's quota group)
@@ -2056,9 +2131,15 @@ def main():
             },
             "context_window": {
                 "total_input_tokens": 239000,
-                "total_output_tokens": 5600,
-                "context_window_size": 1000000,
-                "used_percentage": 24.5
+                "total_output_tokens": 61200,
+                "context_window_size": 1048576,
+                "used_percentage": 22.8,
+                "current_usage": {
+                    "input_tokens": 35600,
+                    "output_tokens": 420,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 220800,
+                },
             },
             "quota": {
                 "five_hour": {
